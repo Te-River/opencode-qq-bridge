@@ -1,57 +1,50 @@
-# opencode-qq-plugin（OpenCode QQ Bot）
+# openqq-bridge（OpenCode V2 版 QQ 机器人）
 
-通过 QQ 机器人与 OpenCode AI 编程助手对话。
-
-> **本项目基于 [gbwssve/opencode-qq-bot](https://github.com/gbwssve/opencode-qq-bot)（MIT）fork 改造**，
-> 在原项目"能用"的基础上做了大量"好用"级增强，详见下文「增强功能」。
-> 上游许可证为 MIT（README 声明，见 `LICENSE`）。
+通过 QQ 机器人与 **OpenCode** 对话：群聊 `@机器人` 或私聊均可，支持命令、会话管理、
+**图片/文件互通**、**中间进度**、**后台任务跟踪**、**原生 Markdown**、**模型跨会话沿用** 等。
 
 ---
 
-## 增强功能（vs 上游）
+## 来源与许可
 
-原项目实现了 QQ ↔ OpenCode 的基础对话链路；本 fork 在真实 NAS 环境中长期运行后，
-围绕「手机 QQ 场景的可靠性」做了以下增强：
+本仓库是 **OpenCode V2 移植版 fork**：
 
-### 1. 图片消息支持
-- **QQ 发图 → OpenCode 识图**：桥侧自动下载图片转 data URI 后传给 opencode
-- 上游踩坑点已解决：opencode `file` part 只接受 data URI，不接受远程 URL
+- 上游一：[gbwssve/opencode-qq-bot](https://github.com/gbwssve/opencode-qq-bot)（MIT）——最初的 QQ ↔ OpenCode 基础桥
+- 上游二：`@soulglad/opencode-qq-plugin` 0.1.0（基于上游一改造并发布到 npm，MIT）——本仓库的代码基
+- 本仓库：[ddaayy/opencode-qq-bridge](https://github.com/ddaayy/opencode-qq-bridge)
 
-### 2. 消息队列（不再丢消息）
-- 上游：同一用户处理中收到新消息直接拒绝「上一条还在处理」
-- 本版：**per-user 队列**，新消息入队，回复「排第 N 位」，处理完自动继续
+OpenCode 从 V1 到 V2 的 **server API 与 SDK 是破坏性变更**，上游代码无法直接对接 V2，
+因此本仓库**重写了 OpenCode 接入层**，并在此基础上新增了大量功能。
+具体移植与变更细节见 [`PORT-NOTES.md`](./PORT-NOTES.md)。
 
-### 3. 权限 auto-ack（解决 ask 悬空死锁）
-- 上游：opencode 触发权限询问（ask）时，QQ 无法交互应答 → 会话卡死 5 分钟超时
-- 本版：桥监听 `permission.updated` 事件，按规则**自动回复**：
-  - `bash` 命令 → allow
-  - 工作区内 read/edit → allow
-  - 外部目录 → reject
-- 手机 QQ 场景下权限询问不再悬空
-
-### 4. 状态感知 + 续消息（解决超时误判）
-- 上游：固定 5 分钟超时，AI 处理中用户完全不知道进展
-- 本版：
-  - 收到 AI 输出 → 自动续期活动时间
-  - 超时前每 30s **轮询服务端拉取结果**（事件丢失兜底）
-  - 间隔 60s 向 QQ 发送「AI 正在处理，请稍候…」
-  - **即使 SSE 事件丢失，也能兜底拉回已完成的结果**
-
-### 5. `/kill` 命令
-- 终止当前 AI 处理 + 清空排队消息，避免卡死对话
-
-### 6. 模型切换 / token 统计
-- `/model` 模型列表 + 切换
-- `/cache` 查看 token/上下文占用，超阈值提示 `/compact` 或 `/new`
+许可证：**MIT**（见 [`LICENSE`](./LICENSE)）。
 
 ---
 
-## 功能特性（继承上游）
+## 本仓库主要改动（相对上游）
 
-- **QQ 群聊 + 私聊** - @机器人 或直接私信，两种方式都支持
-- **内嵌 OpenCode** - 自动启动 opencode serve，无需手动管理进程
-- **会话管理** - 每用户独立会话，支持新建、切换、重命名
-- **命令系统** - 覆盖常用操作（见下方命令列表）
+1. **接入层重写为 OpenCode V2 API**：直接调用 `/api/*`，使用 HTTP Basic 鉴权，并支持**服务地址自动发现**。
+2. **事件适配 V2**：基于 `session.text.*` / `session.execution.*` / `permission.asked` 等原生事件。
+3. **中间进度**：工具调用、工具返回、中间说明、心跳等关键节点通过**主动消息**推送到 QQ。
+4. **超时改为"无活动"判定**：有输出/工具调用就持续续期，不再固定 5 分钟硬超时。
+5. **图片/文件双向互通**：QQ ↔ OpenCode 收发图片与文件（二进制落盘交给 AI 用工具处理）。
+6. **后台任务监视器**：长命令转后台后，自动心跳并在 AI 续跑时把结果转发给用户。
+7. **模型 / Agent 跨会话沿用**：用户不主动切换就不会改变（含重启恢复）。
+8. **QQ 原生 Markdown**：agent 生成的格式原样渲染，失败自动回退纯文本。
+
+---
+
+## 功能特性
+
+- **QQ 群聊 + 私聊**：`@机器人` 或私信
+- **连接本机 OpenCode**：连接运行中的 OpenCode 服务（无需自启服务）
+- **会话管理**：每用户独立会话，支持新建 / 切换 / 重命名
+- **消息队列**：同一用户消息排队处理，不丢弃
+- **权限自动应答**：`permission.asked` 自动回复（bash/工作区内 → allow，外部 → reject），避免询问悬空
+- **图片识图**、**文件解析**、**机器人回传文件**
+- **进度可见**：工具调用 / 返回摘要 / 中间说明 / 心跳
+- **后台任务跟踪**
+- **命令系统 + 透传**：未识别的 `/xxx` 透传给 OpenCode 原生执行
 
 ---
 
@@ -59,148 +52,238 @@
 
 | 命令 | 功能 |
 |------|------|
-| `/new` | 创建新会话 |
+| `/new` | 创建新会话（沿用当前模型/Agent） |
 | `/stop` | 停止当前 AI 运行 |
-| `/kill` | 终止 AI 处理 + 清空排队消息（增强） |
-| `/status` | 查看服务器和当前会话状态 |
-| `/sessions` | 列出历史会话，回复序号切换 |
+| `/kill` | 终止 AI 处理 + 清空排队消息 |
+| `/status` | 查看服务器与当前会话状态 |
+| `/sessions` | 列出**本机器人创建的**历史会话，回复序号切换 |
 | `/help` | 查看帮助 |
 | `/model` | 列出可用模型，回复序号切换 |
 | `/model <provider/model>` | 直接切换到指定模型 |
 | `/agent` | 列出可用 Agent |
 | `/agent <name>` | 切换 Agent |
 | `/rename <name>` | 重命名当前会话 |
-| `/cache` | 查看 token/上下文统计（增强） |
-| `/compact` | 压缩会话（调用 opencode summarize） |
-| 其他 `/命令` | **透传**给 opencode 原生执行（如 `/init`、`/review` 等） |
-
-**透传命令**：未识别的 `/xxx` 会透传给 opencode 的 `session.command` 原生执行，返回结果摘要。opencode 支持的 slash 命令都能在 QQ 里用。
+| `/cache` | 查看 token / 上下文统计 |
+| `/compact` | 压缩会话 |
+| 其他 `/命令` | **透传**给 OpenCode 原生执行（如 `/init`、`/review`） |
 
 ---
 
-## 快速开始
-
-### 前置条件
+## 前置条件
 
 - [Bun](https://bun.sh) >= 1.0
-- [OpenCode](https://opencode.ai) 已安装
-- QQ 机器人的 AppID 和 AppSecret
+- [OpenCode](https://opencode.ai)（**V2**）已安装并正在运行
+- QQ 机器人的 AppID 与 AppSecret（[q.qq.com](https://q.qq.com)）
 
-### 启动
+## 安装与运行
 
 ```bash
 bun install
 bun run src/index.ts
 ```
 
-首次运行会自动引导你填写 QQ 机器人凭证（保存在 `~/.openqq/.env`）。
+首次运行会引导填写 QQ 凭证，保存到 `~/.openqq/.env`。
 
-### 连接外部 OpenCode
+### 连接 OpenCode（自动发现）
 
-```bash
-# 方式 1: 环境变量
-OPENCODE_BASE_URL=http://localhost:4096 openqq
+默认自动发现本机运行中的 OpenCode 服务：
 
-# 方式 2: 写入 ~/.openqq/.env
-echo "OPENCODE_BASE_URL=http://localhost:4096" >> ~/.openqq/.env
-```
+1. `OPENCODE_BASE_URL`（可选）；
+2. 否则执行 `opencode service status` 取地址，并从 `~/.config/opencode/service.json` 读取密码。
 
-### 图片消息（QQ 发图 → opencode 识图）
-
-桥侧自动下载 QQ 图片 → 转 data URI → 作为 `file` part 传给 opencode。
-
-> **桥（Node 服务端）连 opencode 不受 Secure Context 限制**：`crypto.subtle` 在 Node 运行时始终可用。桥的 `OPENCODE_BASE_URL` 指向 **`http://localhost:4096` 即可正常处理图片**（实测通过）。
->
-> **Secure Context 限制只影响 Web UI（浏览器）**：opencode 处理图片附件在浏览器端用 `crypto.subtle.digest("SHA-256", …)` 算哈希，浏览器要求 HTTPS 或 localhost。若 Web UI 被**其他设备**通过局域网 IP 明文 HTTP（`http://192.168.x.x:4096`）访问，非 secure context → `crypto.subtle` 为 `undefined` → 报 `Cannot read properties of undefined (reading 'digest')`，图片失败。
->
-> **结论**：桥连本机 `localhost` 就够，无需 HTTPS。HTTPS 反代（如下）主要是让 **Web UI 能被跨设备访问**时图片也能用。
->
-> 另：opencode 的 `file` part **只接受 data URI（base64 内联），不接受远程 URL**（QQ 直链或公网 URL 都返回 `BadRequest`），桥的 `downloadToDataUri()` 解决此事。
-
-### 生产建议：opencode 挂 HTTPS（nginx）
-
-主要解决两个场景（与桥的图片链路无关）：
-1. **Web UI 跨设备访问**（浏览器 Secure Context，图片可用）
-2. **SSE 长连接被反代缓冲/超时**（`proxy_buffering off`）
+也可显式指定：
 
 ```bash
-# .openqq/.env
-OPENCODE_BASE_URL=https://127.0.0.1:8888
+# ~/.openqq/.env
+OPENCODE_BASE_URL=http://127.0.0.1:4096
+OPENCODE_PASSWORD=xxxxx
 ```
 
-nginx 配套：
-- 关 SSE 缓冲：`proxy_buffering off`、`proxy_cache off`
-- 长连接超时：`proxy_read_timeout` / `proxy_send_timeout` ≥ 数分钟
-- 证书 hostname 不匹配时（IP 直连），桥容器设 `NODE_TLS_REJECT_UNAUTHORIZED=0`
+> OpenCode 后台服务端口是动态的。桥在启动时发现地址，SSE 断线时会**重新发现**；
+> 若地址发生变化且连接未断，重启桥即可。
+
+### systemd user 服务（可选，开机自启 + 崩溃重启）
+
+`~/.config/systemd/user/openqq.service`：
+
+```ini
+[Unit]
+Description=OpenQQ Bridge (OpenCode QQ Bot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=%h
+WorkingDirectory=%h
+ExecStart=%h/.bun/bin/openqq
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now openqq.service
+```
 
 ---
 
 ## 配置说明
 
-所有配置通过环境变量或 `~/.openqq/.env` 文件管理：
+配置通过环境变量或 `~/.openqq/.env` 管理。
 
-| 变量 | 必填 | 默认值 | 说明 |
-|------|------|--------|------|
+### 基础
+
+| 变量 | 必填 | 默认 | 说明 |
+|------|------|------|------|
 | `QQ_APP_ID` | 是 | - | QQ 机器人 AppID |
 | `QQ_APP_SECRET` | 是 | - | QQ 机器人 AppSecret |
-| `QQ_SANDBOX` | 否 | `false` | 是否使用沙箱环境 |
-| `OPENCODE_BASE_URL` | 否 | (自动启动) | 外部 opencode serve 地址 |
-| `OPENCODE_WORKSPACE` | 否 | - | OpenCode 工作区目录（按 directory 过滤事件） |
-| `OPENCODE_DEFAULT_MODEL` | 否 | (自动选) | 默认模型；**留空时自动选免费+支持读图的模型** |
-| `ALLOWED_USERS` | 否 | (不限制) | 允许使用的 QQ 用户 ID，逗号分隔 |
+| `QQ_SANDBOX` | 否 | `false` | 沙箱环境 |
+| `ALLOWED_USERS` | 否 | 不限制 | 允许使用的 QQ 用户 ID，逗号分隔 |
 | `MAX_REPLY_LENGTH` | 否 | `3000` | 单条回复最大字符数 |
 
-### 会话/模型绑定持久化（`~/.openqq/state.json`）
+### OpenCode
 
-**静态配置在 `.env`，动态绑定在 `state.json`**（运行时读写，两者分离）：
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `OPENCODE_BASE_URL` | 自动发现 | OpenCode 服务地址 |
+| `OPENCODE_PASSWORD` | 自动发现 | OpenCode 服务密码 |
+| `OPENCODE_BIN` | 自动探测 | `opencode` 可执行文件路径（用于 `service status`） |
+| `OPENCODE_WORKSPACE` | 服务端 cwd | 工作区目录（按 directory 过滤事件/会话） |
 
-- `state.json` 记录每个 QQ 用户的 **session 绑定 + 模型绑定 + agent 绑定**
-- **重启桥不丢失**：启动时自动恢复会话和模型
-- 模型绑定在 `/model` 切换后写入，重启后继续用上次选的模型
+### 进度 / 超时
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `PROGRESS` | `on` | 是否输出中间进度 |
+| `PROGRESS_MAX` | `0` | 最多几条进度，`0` = 不限 |
+| `PROGRESS_MIN_INTERVAL_MS` | `1200` | 进度消息最小间隔 |
+| `PROGRESS_HEARTBEAT_MS` | `60000` | 无输出时心跳间隔 |
+| `PROGRESS_TEXT_MAX` | `600` | 中间说明单条截断长度 |
+| `PROGRESS_TOOL_RESULT` | `on` | 是否输出工具返回摘要 |
+| `PROGRESS_TOOL_RESULT_MAX` | `300` | 工具返回摘要截断长度 |
+| `RESPONSE_IDLE_TIMEOUT_MS` | `600000` | 多久**无任何输出**判超时（有活动会续期） |
+| `RESPONSE_MAX_MS` | `3600000` | 单次处理绝对上限 |
+
+### 附件 / 发文件
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `ATTACHMENT_MAX_BYTES` | `26214400` | QQ 发来的附件体积上限（25MB） |
+| `ATTACHMENT_DIR` | `~/.openqq/attachments` | 二进制附件落盘目录 |
+| `SEND_FILE_MAX_BYTES` | `104857600` | 机器人发回文件的体积上限（100MB） |
+| `SEND_FILE_HINT` | `on` | 是否在提示里注入发文件说明 |
+
+### 后台任务 / Markdown
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `MONITOR` | `on` | 一轮结束后继续监视会话（转发后台任务自动输出） |
+| `MONITOR_MAX_MS` | `7200000` | 监视器最长存活（2 小时） |
+| `MARKDOWN` | `on` | 文本消息使用 QQ 原生 Markdown（失败回退纯文本） |
+
+### 会话 / 模型绑定持久化（`~/.openqq/state.json`）
+
+静态配置在 `.env`，动态绑定在 `state.json`：记录每个 QQ 用户的
+**会话 + 模型 + Agent** 绑定；重启桥自动恢复；`/new` 沿用当前模型/Agent。
 
 ### 默认模型自动选择
 
-- `OPENCODE_DEFAULT_MODEL` 留空时，启动自动扫描 opencode providers：
-  - 选 **免费（cost=0）+ 支持图片附件（capabilities.attachment + input.image）** 的模型
-  - 优先 `opencode/*` 提供商（避免订阅套餐模型）
-  - 当前命中：`opencode/mimo-v2.5-free`（免费 + 支持读图）
-- 之后可随时 `/model` 切换并持久化
+未绑定模型的用户，启动时自动扫描模型，选择 **免费（cost=0）+ 支持读图** 的模型
+（优先 `opencode/*`）。之后可用 `/model` 切换并持久化。
+
+---
+
+## 图片 / 文件
+
+**QQ → AI**
+
+- 图片：内联为 data URI，由支持视觉的模型识别。
+- 文本类文件（`.txt/.md/.csv/.json/代码…`）：内联为 data URI，内容直接进入上下文。
+- 二进制文件（`.sqlite/.pdf/.docx/.zip/…`）：**保存到磁盘**，并在消息末尾附路径
+  （`[附件] xxx（mime）已保存到：/…`），由 AI 用工具处理。
+  - 例：`.sqlite` 可用 `python3` 的 `sqlite3` 模块读取。
+- QQ 对文件给的 `content_type` 常为 `"file"`（非法 MIME），桥会**按扩展名推断**正确 MIME。
+
+**AI → QQ**
+
+在回复中单独一行写标记：
+
+```
+[[sendfile:/绝对路径]]
+```
+
+桥会：剔除标记 → 上传富媒体 → 以 `msg_type=7` 发给用户；支持多个标记、`file://` 形式，
+类型按扩展名判定（图片/视频/语音/文件）。失败会在文本末尾附 `⚠ 文件发送失败：…`。
+
+---
+
+## 进度 / 超时 / 后台任务
+
+- 关键节点（`🔧 调用工具`、`📄 工具返回`、`❌ 工具失败`、`💬 中间说明`、`⏳ 心跳`）走**主动消息**，
+  不占用被动回复次数。
+- 一轮结束后，若 OpenCode 把长命令**移到后台**，桥会：
+  - 持续发送 `⏳ 后台任务仍在进行…` 心跳；
+  - 后台命令完成、AI **自动续跑**时，把工具调用与结果转发给用户。
+- 超时只看"**是否长时间完全无输出**"，有活动会持续续期。
+
+---
+
+## Markdown
+
+所有文本消息（回复 / 进度 / 命令 / 心跳 / 后台转发）默认使用 QQ **原生 Markdown**
+（`msg_type: 2` + `markdown.content`），agent 生成的标题、粗体、列表、代码块等会原样渲染；
+发送失败自动回退纯文本。`MARKDOWN=off` 可关闭。
 
 ---
 
 ## 工作原理
 
 ```
-QQ 用户发消息
-     |
-     v
+QQ 用户消息
+   │
+   ▼
 QQ Gateway (WebSocket)
-     |
-     v
-Bridge 桥接层
-     +---> /命令 ---> 命令处理 ---> 回复
-     +---> 普通消息 ---> 队列排队 ---> OpenCode SDK prompt()
-                                     |
-                                     v
-                             SSE 事件流 + 30s 轮询兜底
-                                     |
-                                     v
-                          session.idle / 轮询拉取 ---> 回复 QQ
+   │
+   ▼
+Bridge
+   ├─ /命令 ──────────────► 命令处理 ──► 回复
+   └─ 普通消息 ─► 队列 ─► OpenCode V2 API（prompt）
+                          │        ▲
+                          │        └─ HTTP Basic + 服务自动发现
+                          ▼
+                    SSE /api/event（session.text.* / execution.* / permission.asked）
+                          │
+             ┌────────────┴─────────────┐
+             ▼                          ▼
+       进度（主动消息）            最终结果（被动回复）
 ```
 
-- 消息**队列化**：同用户消息排队处理，不丢弃
-- **权限 auto-ack**：permission.updated 事件自动回复，杜绝 ask 悬空
-- 全局一个 SSE 连接，EventRouter 按 sessionId 分发
-- **事件 + 轮询双通道**：SSE 丢失时轮询兜底拉回结果
+- 全局一个 SSE 连接，`EventRouter` 按 `sessionId` 分发
+- 事件 + 轮询双通道：SSE 丢失时轮询兜底拉回结果
+- 权限 `permission.asked` 自动应答
+
+---
+
+## 注意
+
+- **QQ 被动回复次数有限**：最终结果用被动回复关联原消息；进度用主动消息，二者独立。
+- **主动消息额度**由 QQ 侧限制；进度发送失败只记日志，不影响主流程。
+- OpenCode 后台服务端口动态；桥会重新发现，必要时重启桥。
+- 二进制附件会落盘到 `ATTACHMENT_DIR`，注意磁盘占用与清理。
 
 ---
 
 ## 致谢
 
-- [OpenCode](https://opencode.ai) - AI 编程助手
-- [gbwssve/opencode-qq-bot](https://github.com/gbwssve/opencode-qq-bot) - 上游项目（MIT）
-- [sliverp/qqbot](https://github.com/sliverp/qqbot) - QQ Bot API 封装参考
-- [grinev/opencode-telegram-bot](https://github.com/grinev/opencode-telegram-bot) - 架构参考
+- [OpenCode](https://opencode.ai) — AI 编程助手
+- [gbwssve/opencode-qq-bot](https://github.com/gbwssve/opencode-qq-bot) — 最初上游（MIT）
+- `@soulglad/opencode-qq-plugin`（marcusjiang）— 本仓库的代码基（MIT）
+- [sliverp/qqbot](https://github.com/sliverp/qqbot) — QQ Bot API 封装参考
+- [grinev/opencode-telegram-bot](https://github.com/grinev/opencode-telegram-bot) — 架构参考
 
 ## License
 
