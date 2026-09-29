@@ -1,0 +1,20 @@
+{
+  "name": "openqq-bridge-v2",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "QQ 机器人与 OpenCode 对话桥（V2 API 移植版）",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun run --watch src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "typescript": "^5.9.0"
+  }
+}
