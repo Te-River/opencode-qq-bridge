@@ -163,10 +163,36 @@ systemctl --user enable --now openqq.service
 | `PROGRESS_MIN_INTERVAL_MS` | `1200` | 进度消息最小间隔 |
 | `PROGRESS_HEARTBEAT_MS` | `60000` | 无输出时心跳间隔 |
 | `PROGRESS_TEXT_MAX` | `600` | 中间说明单条截断长度 |
+| `PROGRESS_TOOL_CALL` | `on` | 是否输出「🔧 调用工具」进度 |
 | `PROGRESS_TOOL_RESULT` | `on` | 是否输出工具返回摘要 |
 | `PROGRESS_TOOL_RESULT_MAX` | `300` | 工具返回摘要截断长度 |
 | `RESPONSE_IDLE_TIMEOUT_MS` | `600000` | 多久**无任何输出**判超时（有活动会续期） |
 | `RESPONSE_MAX_MS` | `3600000` | 单次处理绝对上限 |
+
+### 流式输出（实验性）
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `STREAMING` | `off` | 流式输出开关（`on`/`off`），仅私聊生效 |
+| `STREAMING_PROACTIVE` | `off` | 流式开流走主动消息通道（`on`/`off`）：不占被动回复预算，需用户在 QQ 客户端开启「允许主动消息」，失败自动回退被动。主动模式当前被 QQ 服务端拒绝（50015001），保留选项待官方放开 |
+| `STREAMING_INTERVAL_MS` | `500` | 任意两次流式发送的最小间隔（防频控，对齐官方 SDK 默认节流） |
+| `STREAMING_CHUNK_SIZE` | `500` | 兼容保留（replace 全量模式下不再切分正文单片） |
+| `STREAMING_MAX_SCENES` | `3` | 占位流条数上限（占位流+正文流共享被动回复 4 次预算） |
+
+### 分场景文案（可选）
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `TEXT_WAITING` | `请稍候{dots}` | 等待占位文案（`{dots}` 为动画点） |
+| `TEXT_TOOL_CALL` | `🔧 调用工具：{tool}` | 工具调用进度 |
+| `TEXT_TOOL_RESULT` | `📄 {tool} 返回：{result}` | 工具返回摘要 |
+| `TEXT_TOOL_FAILED` | `❌ 工具失败：{error}` | 工具失败提示 |
+| `TEXT_TEXT` | `💬 {snippet}` | 中间说明 |
+| `TEXT_HEARTBEAT` | `⏳ 仍在处理中（已用 {min} 分 {sec} 秒）…` | 心跳 |
+| `TEXT_PERMISSION` | `🔒 需要授权：{title}` | 权限提示（仅流式开启时显示） |
+| `TEXT_BODY` | `{body}` | 正文模板（首片前缀） |
+
+未配置时使用默认值（与现行文案逐字一致）；逐条覆盖，未知占位符原样保留。
 
 ### 附件 / 发文件
 
@@ -219,6 +245,15 @@ systemctl --user enable --now openqq.service
 桥会：剔除标记 → 上传富媒体 → 以 `msg_type=7` 发给用户；支持多个标记、`file://` 形式，
 类型按扩展名判定（图片/视频/语音/文件）。失败会在文本末尾附 `⚠ 文件发送失败：…`。
 
+标记里也可以直接写 **公网 URL**：
+
+```
+[[sendfile:https://example.com/pic.png]]
+```
+
+此时走 QQ 官方 **URL 上传**：平台自动下载转存，无需本地落盘；`file_type` 按 URL 扩展名推断
+（图片/视频/语音/文件，未知扩展按文件处理），体积限制由平台侧处理（跳过本地 `SEND_FILE_MAX_BYTES` 检查）。
+
 ---
 
 ## 进度 / 超时 / 后台任务
@@ -229,6 +264,28 @@ systemctl --user enable --now openqq.service
   - 持续发送 `⏳ 后台任务仍在进行…` 心跳；
   - 后台命令完成、AI **自动续跑**时，把工具调用与结果转发给用户。
 - 超时只看"**是否长时间完全无输出**"，有活动会持续续期。
+
+---
+
+## 流式输出（实验性）
+
+`STREAMING=on` 后，私聊回复改为 QQ 官方**流式消息**：先发「请稍候…」占位气泡（点号动画），
+随后按场景切换文案（工具调用 / 返回摘要 / 心跳等），AI 正文产出时每帧以
+`input_mode=replace` 携带**当前累计全文**更新正文气泡（官方 SDK 同款语义）。
+
+- **仅私聊生效**：群聊消息不支持流式参数，自动走原有发送逻辑。
+- **错误自动回退**：任何流式接口失败（频控 / 前缀冲突 / 网络）都会自动降级为
+  普通主动消息 + 最终全文被动回复，用户始终能收到完整结果。
+- **频控重试**：50002 / HTTP 429 按官方策略最多重试 3 次（指数退避），重试时 `index` 前进；
+  重试耗尽则跳帧不推进已下发基准，收尾比对失败自动回退全文。
+- **思考标签剥离**：正文下发前剥离 `<thinking>`、`<system-reminder>`、`<previous_response>`
+  及 deepseek 反引号风格等模型思考标签（官方 sanitize 同款）。
+- **被动回复预算**：QQ 限制单条消息最多被动回复 4 次。`STREAMING_PROACTIVE=on` 时
+  开流走主动消息通道（不带 `msg_id`），不占被动预算（开流上限放宽为 10，受主动消息
+  20 条/分钟频控约束），兜底被动回复恒有名额；`STREAMING_PROACTIVE=off` 时占位流与
+  正文流共享被动预算，`STREAMING_MAX_SCENES` 默认 3，预算用尽后进度改走主动消息。
+- **需真机验证**：流式接口的分片协议（终片形状、`msg_seq` 复用、40007 前缀约束）
+  依据官方文档实现，沙箱/文档未覆盖的行为均已按可回退分支设计，建议先在小范围验证。
 
 ---
 

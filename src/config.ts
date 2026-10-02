@@ -1,10 +1,32 @@
 // @input:  process.env, ~/.openqq/.env
-// @output: Config, loadConfig, ensureConfig
+// @output: Config, ProgressConfig, StreamingConfig, DEFAULT_PROGRESS, loadConfig, ensureConfig
 // @pos:    根层 - 环境变量加载 + 首次运行交互式引导
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs"
 import { join } from "path"
 import { homedir } from "os"
 import { createInterface } from "readline"
+import type { Scene } from "./copy.js"
+
+/** 中间进度开关（env 名/默认值 = 原 bridge.ts 模块常量逐字迁移） */
+export interface ProgressConfig {
+  enabled: boolean // PROGRESS，默认 true
+  max: number // PROGRESS_MAX，默认 0（不限）
+  minIntervalMs: number // PROGRESS_MIN_INTERVAL_MS，默认 1200
+  heartbeatMs: number // PROGRESS_HEARTBEAT_MS，默认 60000
+  textMax: number // PROGRESS_TEXT_MAX，默认 600
+  toolCall: boolean // PROGRESS_TOOL_CALL，默认 true
+  toolResult: boolean // PROGRESS_TOOL_RESULT，默认 true
+  toolResultMax: number // PROGRESS_TOOL_RESULT_MAX，默认 300
+}
+
+/** 流式输出（实验性，仅私聊生效） */
+export interface StreamingConfig {
+  enabled: boolean // STREAMING，默认 off
+  proactive: boolean // STREAMING_PROACTIVE，默认 off（开流走主动消息通道：不带 msg_id，不占被动回复预算；主动模式当前被 QQ 服务端拒绝 50015001，待官方放开后可切回 on）
+  intervalMs: number // STREAMING_INTERVAL_MS，默认 500（对齐官方 SDK DEFAULT_THROTTLE_MS；任意两次 HTTP 发送最小间隔）
+  chunkSize: number // STREAMING_CHUNK_SIZE，默认 500（正文单片最大字符数）
+  maxScenes: number // STREAMING_MAX_SCENES，默认 3（占位流条数上限：占位流+正文流共享被动回复 4 次预算）
+}
 
 export interface Config {
   qq: {
@@ -19,6 +41,21 @@ export interface Config {
   }
   allowedUsers: string[]
   maxReplyLength: number
+  streaming: StreamingConfig
+  progress: ProgressConfig
+  texts: Partial<Record<Scene, string>>
+}
+
+/** progress 参数缺省兜底（waitForSessionReply 尾参默认值），与 env 默认一致 */
+export const DEFAULT_PROGRESS: ProgressConfig = {
+  enabled: true,
+  max: 0,
+  minIntervalMs: 1200,
+  heartbeatMs: 60 * 1000,
+  textMax: 600,
+  toolCall: true,
+  toolResult: true,
+  toolResultMax: 300,
 }
 
 const CONFIG_DIR = join(homedir(), ".openqq")
@@ -70,6 +107,20 @@ export async function ensureConfig(): Promise<void> {
     `# OPENCODE_BASE_URL=http://localhost:4096`,
     `ALLOWED_USERS=`,
     `MAX_REPLY_LENGTH=3000`,
+    `# STREAMING=off`,
+    `# STREAMING_PROACTIVE=off`,
+    `# STREAMING_INTERVAL_MS=500`,
+    `# STREAMING_CHUNK_SIZE=500`,
+    `# STREAMING_MAX_SCENES=3`,
+    `# PROGRESS_TOOL_CALL=on`,
+    `# TEXT_WAITING=请稍候{dots}`,
+    `# TEXT_TOOL_CALL=🔧 调用工具：{tool}`,
+    `# TEXT_TOOL_RESULT=📄 {tool} 返回：{result}`,
+    `# TEXT_TOOL_FAILED=❌ 工具失败：{error}`,
+    `# TEXT_TEXT=💬 {snippet}`,
+    `# TEXT_HEARTBEAT=⏳ 仍在处理中（已用 {min} 分 {sec} 秒）…`,
+    `# TEXT_PERMISSION=🔒 需要授权：{title}`,
+    `# TEXT_BODY={body}`,
   ].join("\n") + "\n"
 
   writeFileSync(ENV_FILE, envContent)
@@ -106,6 +157,17 @@ export function loadConfig(): Config {
     ? allowedRaw.split(",").map((s: string) => s.trim()).filter(Boolean)
     : []
 
+  // 分场景文案：键名 = TEXT_ + Scene 名，机械映射；留空/未配置 = 用 DEFAULT_COPY
+  const sceneKeys: Scene[] = [
+    "WAITING", "TOOL_CALL", "TOOL_RESULT", "TOOL_FAILED",
+    "TEXT", "HEARTBEAT", "PERMISSION", "BODY",
+  ]
+  const texts: Partial<Record<Scene, string>> = {}
+  for (const key of sceneKeys) {
+    const value = process.env[`TEXT_${key}`]?.trim()
+    if (value) texts[key] = value
+  }
+
   return {
     qq: {
       appId,
@@ -119,5 +181,23 @@ export function loadConfig(): Config {
     },
     allowedUsers,
     maxReplyLength: parseInt(process.env.MAX_REPLY_LENGTH ?? "3000", 10),
+    streaming: {
+      enabled: (process.env.STREAMING ?? "off").toLowerCase() === "on",
+      proactive: (process.env.STREAMING_PROACTIVE ?? "off").toLowerCase() === "on",
+      intervalMs: parseInt(process.env.STREAMING_INTERVAL_MS ?? "500", 10),
+      chunkSize: parseInt(process.env.STREAMING_CHUNK_SIZE ?? "500", 10),
+      maxScenes: parseInt(process.env.STREAMING_MAX_SCENES ?? "3", 10),
+    },
+    progress: {
+      enabled: (process.env.PROGRESS ?? "on").toLowerCase() !== "off",
+      max: parseInt(process.env.PROGRESS_MAX ?? "0", 10),
+      minIntervalMs: parseInt(process.env.PROGRESS_MIN_INTERVAL_MS ?? "1200", 10),
+      heartbeatMs: parseInt(process.env.PROGRESS_HEARTBEAT_MS ?? String(60 * 1000), 10),
+      textMax: parseInt(process.env.PROGRESS_TEXT_MAX ?? "600", 10),
+      toolCall: (process.env.PROGRESS_TOOL_CALL ?? "on").toLowerCase() !== "off",
+      toolResult: (process.env.PROGRESS_TOOL_RESULT ?? "on").toLowerCase() !== "off",
+      toolResultMax: parseInt(process.env.PROGRESS_TOOL_RESULT_MAX ?? "300", 10),
+    },
+    texts,
   }
 }
