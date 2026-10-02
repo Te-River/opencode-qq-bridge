@@ -446,6 +446,24 @@ export function uploadGroupFile(accessToken: string, groupOpenid: string, option
   return uploadFile(accessToken, `/v2/groups/${groupOpenid}/files`, options)
 }
 
+/** 通过公网 URL 上传富媒体文件（C2C）：平台自动下载转存，无需本地下载，返回 file_info */
+export function uploadC2CFileByUrl(
+  accessToken: string,
+  openid: string,
+  options: { fileType: number; url: string },
+): Promise<string> {
+  return uploadFile(accessToken, `/v2/users/${openid}/files`, options)
+}
+
+/** 通过公网 URL 上传富媒体文件（群聊）：平台自动下载转存，返回 file_info */
+export function uploadGroupFileByUrl(
+  accessToken: string,
+  groupOpenid: string,
+  options: { fileType: number; url: string },
+): Promise<string> {
+  return uploadFile(accessToken, `/v2/groups/${groupOpenid}/files`, options)
+}
+
 /** 发送富媒体消息（C2C），msg_type=7 */
 export async function sendC2CMediaMessage(
   accessToken: string,

@@ -7,6 +7,8 @@ import {
   getNextMsgSeq,
   uploadC2CFile,
   uploadGroupFile,
+  uploadC2CFileByUrl,
+  uploadGroupFileByUrl,
   sendC2CMediaMessage,
   sendGroupMediaMessage,
   sendStreamMessage,
@@ -165,8 +167,24 @@ export function detectOutboundFileType(name: string): number {
   return 4
 }
 
+/** sendfile 标记内容是否为公网 URL（走平台 URL 上传，不落本地） */
+export function isHttpUrl(s: string): boolean {
+  return /^https?:\/\//i.test(s)
+}
+
+/** URL 形式 sendfile 的 file_type 推断：剥掉查询串/锚点后按扩展名判定（1=图片 2=视频 3=语音 4=文件） */
+export function detectUrlFileType(url: string): number {
+  const path = url.split(/[?#]/, 1)[0]
+  const ext = path.toLowerCase().split(".").pop() ?? ""
+  if (["png", "jpg", "jpeg", "gif", "webp", "bmp"].includes(ext)) return 1
+  if (ext === "mp4") return 2
+  if (["silk", "mp3", "wav", "ogg"].includes(ext)) return 3
+  return 4
+}
+
 /**
- * 把本机文件发送给 QQ 用户/群（先上传富媒体，再发 msg_type=7 消息，作为被动回复关联原消息）。
+ * 把本机文件或公网 URL 发送给 QQ 用户/群（先上传富媒体，再发 msg_type=7 消息，作为被动回复关联原消息）。
+ * http(s) URL 走官方 URL 上传：平台自动下载转存，跳过本地读取与 SEND_FILE_MAX_BYTES 体积检查（大小限制由平台侧处理）。
  */
 export async function sendFileToQQ(
   accessToken: string,
@@ -174,6 +192,18 @@ export async function sendFileToQQ(
   filePath: string,
   maxBytes: number = 0,
 ): Promise<void> {
+  if (isHttpUrl(filePath)) {
+    const fileType = detectUrlFileType(filePath)
+    const msgSeq = getNextMsgSeq(ctx.msgId)
+    if (ctx.type === "group" && ctx.groupId) {
+      const fileInfo = await uploadGroupFileByUrl(accessToken, ctx.groupId, { fileType, url: filePath })
+      await sendGroupMediaMessage(accessToken, ctx.groupId, fileInfo, ctx.msgId, msgSeq)
+    } else {
+      const fileInfo = await uploadC2CFileByUrl(accessToken, ctx.userId, { fileType, url: filePath })
+      await sendC2CMediaMessage(accessToken, ctx.userId, fileInfo, ctx.msgId, msgSeq)
+    }
+    return
+  }
   const stat = statSync(filePath)
   if (!stat.isFile()) {
     throw new Error(`不是文件：${filePath}`)

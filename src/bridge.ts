@@ -6,7 +6,7 @@ import { DEFAULT_PROGRESS } from "./config.js"
 import type { MessageContext } from "./qq/types.js"
 import { getAccessToken } from "./qq/api.js"
 import { startInputNotify } from "./qq/input-notify.js"
-import { replyToQQ, sendProactiveToQQ, sendFileToQQ, stripThinkingTags, StreamSession } from "./qq/sender.js"
+import { replyToQQ, sendProactiveToQQ, sendFileToQQ, stripThinkingTags, StreamSession, isHttpUrl } from "./qq/sender.js"
 import { renderCopy, type Scene, type CopyVars } from "./copy.js"
 import { mkdirSync, writeFileSync } from "fs"
 import { join } from "path"
@@ -916,7 +916,9 @@ export function extractSendFiles(text: string): { text: string; files: string[] 
   return { text: cleaned, files }
 }
 
-function resolveSendPath(file: string): string {
+export function resolveSendPath(file: string): string {
+  // http(s) URL：原样返回，走平台 URL 上传（不拼本地路径、不落盘）
+  if (isHttpUrl(file)) return file
   if (file.startsWith("file://")) {
     try {
       return fileURLToPath(file)

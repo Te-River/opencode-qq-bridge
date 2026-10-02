@@ -5,6 +5,8 @@ import {
   classifyStreamError,
   QQApiError,
   sendStreamMessage,
+  uploadC2CFileByUrl,
+  uploadGroupFileByUrl,
   type StreamShard,
 } from "../src/qq/api.js"
 
@@ -227,5 +229,50 @@ describe("apiRequest 默认行为回归", () => {
     await apiRequest(TOKEN, "GET", "/gateway").catch((e) => { caught = e })
     expect((caught as Error).message).toBe("Network error [/gateway]: connection reset")
     expect(classifyStreamError(caught)).toBe("network")
+  })
+})
+
+describe("URL 上传（uploadC2CFileByUrl / uploadGroupFileByUrl）", () => {
+  const GROUP = "GRP1"
+  let urlCalls: Recorded[] = []
+  beforeEach(() => {
+    urlCalls = []
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const raw = typeof init?.body === "string" ? init.body : ""
+      urlCalls.push({
+        url: String(input),
+        method: init?.method ?? "GET",
+        headers: (init?.headers ?? {}) as Record<string, string>,
+        body: raw ? (JSON.parse(raw) as Record<string, unknown>) : {},
+      })
+      return jsonResponse({ file_uuid: "uuid-1", file_info: "FI::url", ttl: 300 })
+    }) as typeof fetch
+  })
+
+  test("单聊端点 POST /v2/users/{openid}/files，返回 file_info 字符串", async () => {
+    const fi = await uploadC2CFileByUrl(TOKEN, OPENID, { fileType: 1, url: "https://cdn.example.com/a.png" })
+    expect(fi).toBe("FI::url")
+    expect(urlCalls).toHaveLength(1)
+    expect(urlCalls[0].method).toBe("POST")
+    expect(urlCalls[0].url).toBe(`https://api.sgroup.qq.com/v2/users/${OPENID}/files`)
+  })
+  test("群聊端点 POST /v2/groups/{group_openid}/files", async () => {
+    const fi = await uploadGroupFileByUrl(TOKEN, GROUP, { fileType: 4, url: "https://cdn.example.com/doc.pdf" })
+    expect(fi).toBe("FI::url")
+    expect(urlCalls[0].url).toBe(`https://api.sgroup.qq.com/v2/groups/${GROUP}/files`)
+  })
+  test("请求体逐项：file_type/url/srv_send_msg=false，无 file_data/file_name", async () => {
+    await uploadC2CFileByUrl(TOKEN, OPENID, { fileType: 2, url: "https://cdn.example.com/v.mp4" })
+    expect(urlCalls[0].body).toEqual({
+      file_type: 2,
+      url: "https://cdn.example.com/v.mp4",
+      srv_send_msg: false,
+    })
+  })
+  test("响应缺 file_info → 抛上传失败错误", async () => {
+    globalThis.fetch = (async () => jsonResponse({ file_uuid: "u" })) as typeof fetch
+    let caught: unknown
+    await uploadC2CFileByUrl(TOKEN, OPENID, { fileType: 1, url: "https://x/a.png" }).catch((e) => { caught = e })
+    expect((caught as Error).message).toContain("文件上传失败")
   })
 })

@@ -1,7 +1,7 @@
 // bridge.test.ts — 桥接层回归：STREAMING=off 黄金文案 / PROGRESS_TOOL_CALL 门控 / 群聊不走流式 / 流式接线
 import "./setup-env.js"
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test"
-import { createBridge } from "../src/bridge.js"
+import { createBridge, resolveSendPath } from "../src/bridge.js"
 import type { Config } from "../src/config.js"
 import type { EventRouter } from "../src/opencode/events.js"
 import type { SessionManager } from "../src/opencode/sessions.js"
@@ -427,5 +427,19 @@ describe("bridge 输入中状态（INPUT_NOTIFY，仅私聊）", () => {
     ])
     await waitFor(() => apiCalls.some((c) => c.body?.msg_id === "MID1"))
     expect(apiCalls.filter((c) => c.body?.msg_type === 6)).toHaveLength(0)
+  })
+})
+
+// ---- resolveSendPath：URL 原样返回，本地路径行为不变 --------------------------
+
+describe("resolveSendPath", () => {
+  test("http/https URL 原样返回（含查询串），不拼本地路径", () => {
+    expect(resolveSendPath("https://example.com/a.png?w=100")).toBe("https://example.com/a.png?w=100")
+    expect(resolveSendPath("http://example.com/a.mp3")).toBe("http://example.com/a.mp3")
+  })
+  test("本地路径与 file:// 行为不变", () => {
+    expect(resolveSendPath("/tmp/a.txt")).toBe("/tmp/a.txt")
+    expect(resolveSendPath("relative/a.txt")).toBe("relative/a.txt")
+    expect(resolveSendPath("file:///tmp/a.txt")).toBe("/tmp/a.txt")
   })
 })

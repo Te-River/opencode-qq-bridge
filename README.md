@@ -251,6 +251,15 @@ systemctl --user enable --now openqq.service
 桥会：剔除标记 → 上传富媒体 → 以 `msg_type=7` 发给用户；支持多个标记、`file://` 形式，
 类型按扩展名判定（图片/视频/语音/文件）。失败会在文本末尾附 `⚠ 文件发送失败：…`。
 
+标记里也可以直接写 **公网 URL**：
+
+```
+[[sendfile:https://example.com/pic.png]]
+```
+
+此时走 QQ 官方 **URL 上传**：平台自动下载转存，无需本地落盘；`file_type` 按 URL 扩展名推断
+（图片/视频/语音/文件，未知扩展按文件处理），体积限制由平台侧处理（跳过本地 `SEND_FILE_MAX_BYTES` 检查）。
+
 ---
 
 ## 进度 / 超时 / 后台任务

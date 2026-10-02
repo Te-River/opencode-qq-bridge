@@ -1,9 +1,12 @@
 // sender.test.ts — StreamSession 状态机：首片/场景切换/节流/错误恢复/收尾/sendfile 标记与思考标签剥离
 // 正文路径为官方 SDK 语义：replace + 全量文本（每帧携带当前累计全文，index 每帧递增）。
-import { afterEach, describe, expect, test } from "bun:test"
-import { StreamSession, type StreamSessionOptions } from "../src/qq/sender.js"
+import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { StreamSession, sendFileToQQ, detectUrlFileType, isHttpUrl, type StreamSessionOptions } from "../src/qq/sender.js"
 import { renderCopy } from "../src/copy.js"
 import type { MessageContext } from "../src/qq/types.js"
+import { mkdtempSync, writeFileSync, rmSync } from "fs"
+import { tmpdir } from "os"
+import { join } from "path"
 
 const realFetch = globalThis.fetch
 
@@ -731,6 +734,133 @@ describe("StreamSession content_type 跟随 MARKDOWN", () => {
       expect(shards(calls).every((x) => x.content_type === "text")).toBe(true)
     } finally {
       delete process.env.MARKDOWN
+    }
+  })
+})
+
+// ---- sendfile URL 上传分支 ---------------------------------------------------
+
+describe("detectUrlFileType 扩展名推断", () => {
+  test("图片扩展 → 1（含大写与查询串）", () => {
+    for (const u of [
+      "https://a.com/p.png", "https://a.com/p.JPG", "https://a.com/p.Jpeg",
+      "https://a.com/p.jpg?w=100", "https://a.com/p.jpeg#frag", "https://a.com/p.gif",
+      "https://a.com/p.webp?v=2", "https://a.com/p.bmp",
+    ]) {
+      expect(detectUrlFileType(u)).toBe(1)
+    }
+  })
+  test("视频 .mp4 → 2（剥查询串/锚点）", () => {
+    expect(detectUrlFileType("https://a.com/v.mp4")).toBe(2)
+    expect(detectUrlFileType("https://a.com/v.mp4?start=30#t=1")).toBe(2)
+  })
+  test("语音 .silk/.mp3/.wav/.ogg → 3", () => {
+    expect(detectUrlFileType("https://a.com/a.silk")).toBe(3)
+    expect(detectUrlFileType("https://a.com/a.mp3?q=1")).toBe(3)
+    expect(detectUrlFileType("https://a.com/a.wav")).toBe(3)
+    expect(detectUrlFileType("https://a.com/a.ogg")).toBe(3)
+  })
+  test("未知/无扩展 → 4（文件）", () => {
+    expect(detectUrlFileType("https://a.com/doc.pdf")).toBe(4)
+    expect(detectUrlFileType("https://a.com/file.tar.gz")).toBe(4)
+    expect(detectUrlFileType("https://a.com/download?id=9")).toBe(4)
+    expect(detectUrlFileType("https://a.com")).toBe(4)
+  })
+  test("isHttpUrl 只认 http/https 前缀", () => {
+    expect(isHttpUrl("https://a.com/a.png")).toBe(true)
+    expect(isHttpUrl("HTTP://a.com/a.png")).toBe(true)
+    expect(isHttpUrl("http://a.com/a.png")).toBe(true)
+    expect(isHttpUrl("/tmp/a.png")).toBe(false)
+    expect(isHttpUrl("file:///tmp/a.png")).toBe(false)
+    expect(isHttpUrl("ftp://a.com/a.png")).toBe(false)
+  })
+})
+
+describe("sendFileToQQ", () => {
+  const origLog = console.log
+  const origErr = console.error
+  beforeEach(() => {
+    console.log = () => {}
+    console.error = () => {}
+  })
+  afterEach(() => {
+    console.log = origLog
+    console.error = origErr
+  })
+
+  function groupCtx(): MessageContext {
+    return { type: "group", groupId: "G1", userId: "U1", msgId: "MID1", content: "hi" }
+  }
+
+  /** fetch 记录器：/files 上传返回 file_info，其余按消息发送返回 id */
+  function mediaRecorder() {
+    const calls: Recorded[] = []
+    let n = 0
+    const fetchImpl = (async (url: unknown, init?: RequestInit) => {
+      n += 1
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {}
+      calls.push({ url: String(url), headers: (init?.headers ?? {}) as Record<string, string>, body, ok: true })
+      const payload = String(url).includes("/files")
+        ? { file_uuid: `uuid-${n}`, file_info: "FI::1", ttl: 300 }
+        : { id: `mid-${n}`, timestamp: 1 }
+      return new Response(JSON.stringify(payload), { status: 200 })
+    }) as typeof fetch
+    return { calls, fetchImpl }
+  }
+
+  test("URL 分支（单聊）：URL 上传 → msg_type=7 媒体发送，跳过体积检查", async () => {
+    const { calls, fetchImpl } = mediaRecorder()
+    globalThis.fetch = fetchImpl
+    // maxBytes=1：URL 分支必须不检查体积（限制由平台侧处理）
+    await sendFileToQQ("tok", c2cCtx(), "https://cdn.example.com/pic.png?w=2", 1)
+    expect(calls).toHaveLength(2)
+    expect(calls[0].url).toBe("https://api.sgroup.qq.com/v2/users/U1/files")
+    expect(calls[0].body).toEqual({
+      file_type: 1,
+      url: "https://cdn.example.com/pic.png?w=2",
+      srv_send_msg: false,
+    })
+    expect(calls[1].url).toBe("https://api.sgroup.qq.com/v2/users/U1/messages")
+    expect(calls[1].body.msg_type).toBe(7)
+    expect((calls[1].body.media as Record<string, unknown>).file_info).toBe("FI::1")
+    expect(calls[1].body.msg_id).toBe("MID1")
+    expect(typeof calls[1].body.msg_seq).toBe("number")
+  })
+
+  test("URL 分支（群聊）：/v2/groups/{gid}/files + 群媒体消息", async () => {
+    const { calls, fetchImpl } = mediaRecorder()
+    globalThis.fetch = fetchImpl
+    await sendFileToQQ("tok", groupCtx(), "https://cdn.example.com/v.mp4")
+    expect(calls[0].url).toBe("https://api.sgroup.qq.com/v2/groups/G1/files")
+    expect(calls[0].body.file_type).toBe(2)
+    expect(calls[0].body.url).toBe("https://cdn.example.com/v.mp4")
+    expect(calls[1].url).toBe("https://api.sgroup.qq.com/v2/groups/G1/messages")
+    expect(calls[1].body.msg_type).toBe(7)
+    expect(calls[1].body.msg_id).toBe("MID1")
+  })
+
+  test("本地路径分支回归：仍走 base64 上传 + 体积检查", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sendfile-"))
+    try {
+      const p = join(dir, "note.txt")
+      writeFileSync(p, "hello")
+      const { calls, fetchImpl } = mediaRecorder()
+      globalThis.fetch = fetchImpl
+      await sendFileToQQ("tok", c2cCtx(), p, 0)
+      expect(calls).toHaveLength(2)
+      expect(calls[0].url).toBe("https://api.sgroup.qq.com/v2/users/U1/files")
+      expect(calls[0].body.file_type).toBe(4)
+      expect(calls[0].body.file_name).toBe("note.txt")
+      expect(calls[0].body.file_data).toBe(Buffer.from("hello").toString("base64"))
+      expect(calls[0].body.url).toBeUndefined()
+      expect(calls[1].body.msg_type).toBe(7)
+
+      // 体积上限仍生效（本地分支不跳过）
+      const big = join(dir, "big.bin")
+      writeFileSync(big, "0123456789")
+      await expect(sendFileToQQ("tok", c2cCtx(), big, 2)).rejects.toThrow("文件过大")
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
     }
   })
 })
