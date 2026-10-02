@@ -202,6 +202,52 @@ const MIN_FLUSH_CHARS = 24
 /** 等待动画帧序列：前缀单调递增，满足 40007「已下发前缀不可修改」约束 */
 const DOTS_FRAMES = ["", ".", "..", "..."] as const
 
+// 与 bridge.ts 的 SEND_FILE_RE 保持一致语义（[[sendfile:路径]]，路径不含 ] 和换行）；
+// 两处需同步修改。流式缓冲用它剥离标记，避免标记原文随正文露给用户。
+const SEND_FILE_MARKER_RE = /\[\[\s*sendfile\s*:\s*([^\]\n]+?)\s*\]\]/gi
+const SEND_FILE_KEYWORD = "sendfile"
+
+/**
+ * text 尾部若是「疑似未闭合的 [[sendfile:...]] 标记前缀」片段（如 [[、[[sendf、
+ * [[sendfile:/tmp/a、或只差一个 ] 的 [[sendfile:/tmp/a]），返回该片段；否则返回 ""。
+ * 从最早的候选 [[ 起算，嵌在路径区里的 [[ 也一并扣留。
+ */
+function trailingSendFileFragment(text: string): string {
+  for (let i = text.indexOf("[["); i !== -1; i = text.indexOf("[[", i + 1)) {
+    if (isSendFilePrefix(text.slice(i))) return text.slice(i)
+  }
+  return ""
+}
+
+/** s（以 [[ 开头）是否仍可能被后续 delta 补全成一个完整标记（SEND_FILE_MARKER_RE 的前缀语言） */
+function isSendFilePrefix(s: string): boolean {
+  let i = 2
+  while (i < s.length && /\s/.test(s[i])) i++
+  for (let k = 0; k < SEND_FILE_KEYWORD.length; k++) {
+    if (i >= s.length) return true // 关键字未输完（含 s 恰为 "[[" 或 "[["+空白）
+    if (s[i] !== SEND_FILE_KEYWORD[k]) return false
+    i++
+  }
+  while (i < s.length && /\s/.test(s[i])) i++
+  if (i >= s.length) return true
+  if (s[i] !== ":") return false
+  i++
+  // 冒号后是路径区（[^\]\n]*）；末尾至多一个 ]（闭合 ]] 的前半，且其前至少 1 个路径字符）
+  let end = s.length
+  let closable = false
+  if (end > i && s[end - 1] === "]") {
+    end--
+    closable = true
+  }
+  let pathChars = 0
+  for (let k = i; k < end; k++) {
+    const ch = s[k]
+    if (ch === "]" || ch === "\n") return false
+    pathChars++
+  }
+  return !closable || pathChars > 0
+}
+
 export interface StreamSessionOptions {
   token: () => Promise<string> // 惰性取 token（复用 getAccessToken 缓存），勿存字符串
   ctx: MessageContext // 仅 C2C；构造时校验，群聊抛错（双保险，bridge 侧已按 ctx.type 过滤）
@@ -235,7 +281,8 @@ export class StreamSession {
   private sceneStreamsOpened = 0 // 已开启的占位流条数（含首条 WAITING）
   private bodyStreamActive = false
   private bodyDelivered = "" // 已成功下发的正文（原始字符，不含 BODY 模板前缀）
-  private bodyBuffer = "" // 待 flush 的正文增量
+  private bodyBuffer = "" // 待 flush 的正文增量（已剥离 sendfile 标记）
+  private markerHold = "" // 扣留的疑似未闭合 [[sendfile: 片段（等后续 delta 补全；终刷时丢弃）
   private activeScene: Scene | null = null
   private dotsFrame = 0
   private dotsTimer: ReturnType<typeof setInterval> | null = null
@@ -302,6 +349,7 @@ export class StreamSession {
           this.bodyStreamActive = false
           this.bodyDelivered = ""
           this.bodyBuffer = ""
+          this.markerHold = "" // 段落已关闭：残片不属于下一段正文（flushBody 终刷后竞态兜底）
           this.streamMsgId = null // 正文流已以终片关闭，避免对已关闭的流再发终片
           this.nextIndex = 0
           return
@@ -335,12 +383,21 @@ export class StreamSession {
     })
   }
 
-  /** 正文增量：缓冲 + 节流 append 分片（达到 minFlush 才发，单片不超过 chunkSize） */
+  /**
+   * 正文增量：缓冲 + 节流 append 分片（达到 minFlush 才发，单片不超过 chunkSize）。
+   * [[sendfile:...]] 标记在进入下发缓冲前剥离：完整的直接删掉；尾部疑似未闭合的
+   * 片段扣留在 markerHold 等后续 delta 补全，避免半截标记闪现（文件由 bridge 的
+   * deliverResult 单独发送，不走流式正文）。
+   */
   async pushBody(delta: string): Promise<void> {
     if (this._state !== "streaming") return
     if (!delta) return
     this.stopDotsTimer()
-    this.bodyBuffer += delta
+    const merged = this.markerHold + delta
+    const stripped = merged.replace(SEND_FILE_MARKER_RE, "")
+    const hold = trailingSendFileFragment(stripped)
+    this.markerHold = hold
+    this.bodyBuffer += hold ? stripped.slice(0, stripped.length - hold.length) : stripped
     await this.enqueue(() => this.flushBody(false))
   }
 
@@ -553,6 +610,8 @@ export class StreamSession {
 
   private async flushBody(final: boolean): Promise<void> {
     if (this._state !== "streaming") return
+    // 终刷（finish / 段落切换）：输出已结束，扣留的未闭合标记残片无意义，直接丢弃，不进终片
+    if (final) this.markerHold = ""
     if (!final && this.bodyBuffer.length < MIN_FLUSH_CHARS) return
 
     if (!this.bodyStreamActive) {

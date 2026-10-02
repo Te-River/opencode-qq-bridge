@@ -241,7 +241,9 @@ export function createBridge(
 
       // 等进度消息都发完，再发最终结果，保证顺序
       await progressChain.catch(() => {})
-      const streamedOk = stream ? await stream.finish(replyText) : false
+      // 比对基准 = 剥离 [[sendfile:...]] 标记后的文本（流式缓冲已剥离同样的标记）。
+      // 不用 extractSendFiles().text：其额外的空白收敛会让不含标记的回复也比对失败
+      const streamedOk = stream ? await stream.finish(replyText.replace(SEND_FILE_RE, "")) : false
       await deliverResult(ctx, replyText, "reply", streamedOk)
 
       // 本轮结束后继续监视：后台任务完成时 OpenCode 会自动让 AI 继续输出，转发给用户
