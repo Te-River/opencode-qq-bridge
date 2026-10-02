@@ -1,5 +1,5 @@
 // @input:  (none - raw HTTP to QQ Bot REST API)
-// @output: getAccessToken, apiRequest, sendC2CMessage, sendGroupMessage, getGatewayUrl, startBackgroundTokenRefresh
+// @output: getAccessToken, apiRequest, QQApiError, sendStreamMessage, classifyStreamError, sendC2CMessage, sendGroupMessage, getGatewayUrl, startBackgroundTokenRefresh
 // @pos:    qq层 - QQ Bot REST API 鉴权+请求封装 (Token singleflight + 后台刷新)
 
 const API_BASE = "https://api.sgroup.qq.com"
@@ -132,8 +132,32 @@ const DEFAULT_API_TIMEOUT = 30000
 const FILE_UPLOAD_TIMEOUT = 120000
 
 /**
+ * 结构化 API 错误：携带 HTTP 状态码与 QQ 业务码（响应体 code 字段，如 40007/50001/50002），
+ * 供流式回退决策。message 格式与原 plain Error 完全一致，现有 catch 只读 message，零回归。
+ */
+export class QQApiError extends Error {
+  readonly status: number
+  readonly code?: number
+  readonly path: string
+  readonly body: unknown
+
+  constructor(status: number, path: string, body: unknown, message: string) {
+    super(message)
+    this.name = "QQApiError"
+    this.status = status
+    this.path = path
+    this.body = body
+    const rawCode = (typeof body === "object" && body !== null
+      ? (body as Record<string, unknown>).code
+      : undefined)
+    this.code = typeof rawCode === "number" ? rawCode : undefined
+  }
+}
+
+/**
  * 统一封装 QQ Bot REST 请求。
  * 保留源实现的超时、日志、错误处理和 JSON 解析行为。
+ * fetchImpl 仅供测试注入（StreamSession 透传），缺省用全局 fetch。
  */
 export async function apiRequest<T = unknown>(
   accessToken: string,
@@ -141,6 +165,7 @@ export async function apiRequest<T = unknown>(
   path: string,
   body?: unknown,
   timeoutMs?: number,
+  fetchImpl?: typeof fetch,
 ): Promise<T> {
   const url = `${API_BASE}${path}`
   const headers: Record<string, string> = {
@@ -178,7 +203,7 @@ export async function apiRequest<T = unknown>(
 
   let res: Response
   try {
-    res = await fetch(url, options)
+    res = await (fetchImpl ?? fetch)(url, options)
   } catch (err) {
     clearTimeout(timeoutId)
     if (err instanceof Error && err.name === "AbortError") {
@@ -211,10 +236,78 @@ export async function apiRequest<T = unknown>(
 
   if (!res.ok) {
     const error = data as { message?: string; code?: number }
-    throw new Error(`API Error [${path}]: ${error.message ?? JSON.stringify(data)}`)
+    throw new QQApiError(res.status, path, data, `API Error [${path}]: ${error.message ?? JSON.stringify(data)}`)
   }
 
   return data
+}
+
+/** 流式消息分片（C2C stream_messages） */
+export interface StreamShard {
+  content: string // content_raw
+  index: number // 从 0 递增（每条流独立计数）
+  inputMode: "append" | "replace"
+  inputState: 1 | 10 // 1=生成中 10=结束
+  contentType?: "text" | "markdown" // 默认 "text"（首版固定 text，字段留扩展）
+  streamMsgId?: string // index>0 时必填（=首片响应 id）
+  msgId?: string // 首片被动锚定
+  eventId?: string
+  msgSeq?: number // 去重；缺省由 api 层 getNextMsgSeq(msgId) 生成
+}
+
+export interface StreamShardResponse {
+  id: string // 即后续分片的 stream_msg_id
+  timestamp: number | string
+  ext_info?: Record<string, unknown>
+  remain_msg_len?: number
+}
+
+/**
+ * 发送 C2C 流式消息分片：POST /v2/users/{openid}/stream_messages。
+ * 鉴权沿用现有 apiRequest 的 QQBot 方案；失败抛 QQApiError（与 api.ts 全体抛错风格一致）。
+ */
+export async function sendStreamMessage(
+  accessToken: string,
+  openid: string,
+  shard: StreamShard,
+  fetchImpl?: typeof fetch,
+): Promise<StreamShardResponse> {
+  const body: Record<string, unknown> = {
+    content_raw: shard.content,
+    input_mode: shard.inputMode,
+    input_state: shard.inputState,
+    index: shard.index,
+    content_type: shard.contentType ?? "text",
+    msg_seq: shard.msgSeq ?? 1,
+  }
+  if (shard.streamMsgId) body.stream_msg_id = shard.streamMsgId
+  if (shard.msgId) body.msg_id = shard.msgId
+  if (shard.eventId) body.event_id = shard.eventId
+  return apiRequest<StreamShardResponse>(accessToken, "POST", `/v2/users/${openid}/stream_messages`, body, undefined, fetchImpl)
+}
+
+/** 流式错误分类：40007→前缀冲突；50002→频控；50001→服务端错误；其他 QQApiError→http；网络/超时→network */
+export type StreamErrorKind =
+  | "prefix-conflict"
+  | "rate-limited"
+  | "server-error"
+  | "http"
+  | "network"
+  | "unknown"
+
+export function classifyStreamError(err: unknown): StreamErrorKind {
+  if (err instanceof QQApiError) {
+    if (err.code === 40007) return "prefix-conflict"
+    if (err.code === 50002) return "rate-limited"
+    if (err.code === 50001) return "server-error"
+    return "http"
+  }
+  if (err instanceof Error) {
+    if (err.message.startsWith("Network error") || err.message.startsWith("Request timeout")) {
+      return "network"
+    }
+  }
+  return "unknown"
 }
 
 /**
