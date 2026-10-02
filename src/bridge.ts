@@ -219,7 +219,7 @@ export function createBridge(
       return progressChain
     }
 
-    // 「正在输入」状态（仅私聊）：回合开始即提示、期间续发；finally 统一 stop()（成功/失败/异常都停）
+    // 「正在输入」状态（仅私聊）：回合开始发一次（默认 60s）；finally 统一 stop()（零请求，仅清理）
     const inputNotify = startInputNotify(ctx, config)
 
     try {
