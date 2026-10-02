@@ -1,4 +1,4 @@
-// sender.test.ts — StreamSession 状态机：首片/场景切换/节流/错误恢复/收尾/sendfile 标记与思考标签剥离
+// sender.test.ts — StreamSession 状态机：首片/场景切换/节流/错误恢复/收尾/sendfile 标记与思考标签剥离/主动开流通道
 // 正文路径为官方 SDK 语义：replace + 全量文本（每帧携带当前累计全文，index 每帧递增）。
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test"
 import { StreamSession, sendFileToQQ, detectUrlFileType, isHttpUrl, type StreamSessionOptions } from "../src/qq/sender.js"
@@ -391,6 +391,89 @@ describe("StreamSession 每片携带 msg_id", () => {
     expect(list[3].content_raw).toBe(A40 + "x")
     expect(list[3].index).toBe(1)
     expect(list[3].msg_id).toBe("MID1")
+  })
+})
+
+// ---- 主动开流通道（STREAMING_PROACTIVE，默认 on） ------------------------------
+
+describe("StreamSession 主动开流（proactive）", () => {
+  test("proactive=on：首片省略 msg_id（主动通道），msg_seq 保留，续片/终片同样不带 msg_id", async () => {
+    const { calls, fetchImpl } = makeRecorder()
+    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500), { proactive: true })))
+    await s.start()
+    await s.pushBody(A40)
+    await s.pushBody(B40) // 续片
+    expect(await s.finish(A40 + B40)).toBe(true) // 终片
+    const list = shards(calls)
+    // 首片：无 msg_id 字段（主动开流，不占被动预算）；msg_seq 仍在（官方 SDK 无条件携带）
+    expect(list[0].msg_id).toBeUndefined()
+    expect(typeof list[0].msg_seq).toBe("number")
+    // 整条流所有分片都不带 msg_id（预算解耦：续片带 msg_id 会让 (msg_id,msg_seq) 对重新上线占名额）
+    expect(list.every((x) => x.msg_id === undefined)).toBe(true)
+    expect(list.every((x) => typeof x.msg_seq === "number")).toBe(true)
+    // 续片/终片仍携带 stream_msg_id（流内续传）
+    const cont = list.filter((x) => x.index >= 1)
+    expect(cont.length).toBeGreaterThanOrEqual(2)
+    expect(cont.every((x) => x.stream_msg_id !== undefined)).toBe(true)
+    expect(s.state).toBe("finished")
+  })
+
+  test("proactive=off（缺省）：首片带 msg_id 被动锚定（回归）", async () => {
+    const { calls, fetchImpl } = makeRecorder()
+    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500), { proactive: false })))
+    await s.start()
+    const list = shards(calls)
+    expect(list[0].msg_id).toBe("MID1")
+    expect(typeof list[0].msg_seq).toBe("number")
+  })
+
+  test("proactive 预算 10：WAITING + 9 段正文开流，第 10 段起仅缓冲（对照被动预算 3）", async () => {
+    const { calls, fetchImpl } = makeRecorder()
+    const proactive: Recorded[] = []
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {}
+      proactive.push({ url: String(url), headers: {}, body })
+      return new Response(JSON.stringify({ id: "p1", timestamp: 1 }), { status: 200 })
+    }) as typeof fetch
+    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500), { proactive: true })))
+    await s.start() // WAITING：开流 1/10
+    const segs = [A40, B40, C40, "D".repeat(40), "E".repeat(40), "F".repeat(40), "G".repeat(40), "H".repeat(40), "I".repeat(40), "J".repeat(40)]
+    for (const seg of segs) {
+      await s.pushBody(seg)
+      await s.switchScene("TEXT", { snippet: "x" })
+    }
+    const list = okShards(calls)
+    // 开流总数 = WAITING + 9 段正文 = 10（主动通道不占被动预算，受主动消息 20/qpm 频控约束放宽）
+    const opens = list.filter((x) => x.index === 0)
+    expect(opens).toHaveLength(10)
+    // 第 10 段（J）预算用尽：从未出现在任何流式分片里，只缓冲
+    expect(sentText(calls)).not.toContain("J".repeat(40))
+    // finish 比对失败 → bridge 走全量兜底
+    expect(await s.finish(segs.join(""))).toBe(false)
+  })
+
+  test("proactive 开流失败 → state=failed，fallbackToReply 仍走被动 replyToQQ（带 msg_id）", async () => {
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => {})
+    try {
+      const { fetchImpl } = makeRecorder(() => new Response(JSON.stringify({ code: 500001, message: "server error" }), { status: 500 }))
+      const replies: Recorded[] = []
+      globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+        const body = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {}
+        replies.push({ url: String(url), headers: {}, body })
+        return new Response(JSON.stringify({ id: "r1", timestamp: 1 }), { status: 200 })
+      }) as typeof fetch
+      const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500), { proactive: true })))
+      await s.start() // 主动开流失败（非频控）→ markFailed
+      expect(s.state).toBe("failed")
+      // 兜底路径：fallbackToReply 以同 msg_id 被动回复发出全量（主动模式不占被动名额，恒有预算）
+      await s.fallbackToReply(A40)
+      expect(replies).toHaveLength(1)
+      expect(replies[0].url).toBe("https://api.sgroup.qq.com/v2/users/U1/messages")
+      expect(replies[0].body.msg_id).toBe("MID1")
+      expect((replies[0].body.markdown as { content: string }).content).toBe(A40)
+    } finally {
+      errSpy.mockRestore()
+    }
   })
 })
 

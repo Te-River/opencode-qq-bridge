@@ -254,15 +254,18 @@ const RATE_LIMIT_RETRIES = 3
 const RATE_LIMIT_BACKOFF_BASE_MS = 1000
 
 /**
- * 开流总次数上限（占位流 + 正文流合并核算）。
- * 算术：QQ 单聊被动回复每个 msg_id 最多 4 次；每个分片都带 msg_id（官方 SDK 语义，
- * 真机实测缺 msg_id 的续片报 50015001），但去重锚定为 msg_id+msg_seq——openStream 换新
- * msg_seq 才消耗名额，流内后续分片共享同 msg_seq 不消耗。fallbackToReply 的全量兜底
- * 同为该 msg_id 的被动回复，保守预留 1 个名额 ⇒ 占位 + 正文的总开流次数 ≤ 4 - 1 = 3。
+ * 开流总次数上限（占位流 + 正文流合并核算），按通道取值：
+ * - 被动（默认回归路径）：QQ 单聊被动回复每个 msg_id 最多 4 次；每个分片都带 msg_id（官方
+ *   SDK 语义，真机实测缺 msg_id 的续片报 50015001），但去重锚定为 msg_id+msg_seq——openStream
+ *   换新 msg_seq 才消耗名额，流内后续分片共享同 msg_seq 不消耗。fallbackToReply 的全量兜底
+ *   同为该 msg_id 的被动回复，保守预留 1 个名额 ⇒ 占位 + 正文的总开流次数 ≤ 4 - 1 = 3。
+ * - 主动（proactive）：开流不带 msg_id，不占被动回复预算，改受主动消息频控约束——QQ 单关系
+ *   主动消息上限 20 条/分钟（20/qpm），取 10 留一半余量给场景降级主动消息与普通进度推送。
  * 用尽后：场景文案走主动消息（与 maxScenes 用尽同款降级），正文只缓冲不发送，
  * finish 比对失败 → bridge 全量兜底，内容不丢、预算不超。
  */
-const MAX_STREAM_OPENS = 3
+const MAX_STREAM_OPENS_PASSIVE = 3
+const MAX_STREAM_OPENS_PROACTIVE = 10
 
 /** 等待动画帧序列：前缀单调递增，满足 40007「已下发前缀不可修改」约束 */
 const DOTS_FRAMES = ["", ".", "..", "..."] as const
@@ -384,7 +387,8 @@ export interface StreamSessionOptions {
   render: (scene: Scene, vars: CopyVars) => string // bridge 传入绑定 config.texts 的 renderCopy
   intervalMs: number // 任意两次 HTTP 发送的最小间隔
   chunkSize: number // 兼容保留（append 时代的正文单片上限；replace 全量模式下不再切分，配置键不动）
-  maxScenes: number // 占位流条数上限（含首条 WAITING；另受 MAX_STREAM_OPENS 总开流预算合并约束）
+  maxScenes: number // 占位流条数上限（含首条 WAITING；另受总开流预算合并约束）
+  proactive?: boolean // 开流走主动消息通道：整条流省略 msg_id，不占被动预算（缺省 false = 被动锚定，回归兼容）
   fetchImpl?: typeof fetch // 测试注入，缺省 globalThis.fetch
   now?: () => number // 测试注入假时钟，缺省 Date.now
 }
@@ -410,8 +414,9 @@ export class StreamSession {
   private streamMsgId: string | null = null // 当前流的 id（最近一次分片响应 id）
   private nextIndex = 0 // 当前流下一片 index（每条新流重置 0）
   private msgSeq = 0 // 每条新流首片取一次 getNextMsgSeq 并在同流内复用（官方示例同流 msg_seq 恒定）
+  private readonly maxStreamOpens: number // 总开流预算：被动 3 / 主动 10（算术见 MAX_STREAM_OPENS_*）
   private sceneStreamsOpened = 0 // 已开启的占位流条数（含首条 WAITING）
-  private bodyStreamsOpened = 0 // 已开启的正文流条数（TEXT 重置后下段另起新流时递增；与占位流合并受 MAX_STREAM_OPENS 约束）
+  private bodyStreamsOpened = 0 // 已开启的正文流条数（TEXT 重置后下段另起新流时递增；与占位流合并受总开流预算约束）
   private bodyBudgetLogged = false // 开流预算用尽的降级日志只打一次（避免逐 delta 刷屏）
   private bodyStreamActive = false
   private rawBody = "" // 当前段正文全量累计（未剥离；剥离在 flush 时对全量重算，无「部分消费」状态）
@@ -431,6 +436,17 @@ export class StreamSession {
     this.opts = options
     this.now = options.now ?? Date.now
     this.fetchImpl = options.fetchImpl
+    this.maxStreamOpens = options.proactive ? MAX_STREAM_OPENS_PROACTIVE : MAX_STREAM_OPENS_PASSIVE
+  }
+
+  /**
+   * 本会话分片是否携带 msg_id：主动模式整条流省略（首片无 msg_id 即为主动开流，续片再带
+   * msg_id 会让 (msg_id, msg_seq) 对重新出现在线上、可能重新占用被动名额，预算解耦失效），
+   * 被动模式保持每片带 msg_id 被动锚定（官方 SDK 语义）。msg_seq 两种模式都保留（官方 SDK
+   * 无条件携带）。
+   */
+  private get shardMsgId(): string | undefined {
+    return this.opts.proactive ? undefined : this.opts.ctx.msgId
   }
 
   get state(): StreamSessionState {
@@ -442,7 +458,7 @@ export class StreamSession {
     return this.lastAcceptedFull
   }
 
-  /** WAITING 首片：index0/replace/state1/msg_id 被动锚定；失败置 state=failed */
+  /** WAITING 首片：index0/replace/state1（被动模式 msg_id 锚定，主动模式省略）；失败置 state=failed */
   async start(): Promise<void> {
     if (this._state !== "idle") return
     try {
@@ -466,7 +482,7 @@ export class StreamSession {
    * 场景切换 = 旧流终片(state10) + 另起新流首片。
    * - 正文流进行中：TEXT 场景=新一段正文（关闭当前正文流，下段另起，不重复发摘要）；
    *   其余场景走主动消息，不打断正文流。
-   * - 占位流预算（maxScenes）或总开流预算（占位+正文合并核算，MAX_STREAM_OPENS）用尽：
+   * - 占位流预算（maxScenes）或总开流预算（占位+正文合并核算）用尽：
    *   场景文案改走主动消息（对齐 STREAMING=off 的进度通道）。
    * - 新流首片失败：重试 1 次（频控先退避），再败 state=failed 并以主动消息发出场景文案。
    */
@@ -493,7 +509,7 @@ export class StreamSession {
       }
 
       // 占位流条数用 maxScenes 衡量；总开流预算（占位+正文合并核算）用尽时同样降级主动消息，
-      // 否则正文段落后的场景切换仍会带 msg_id 开新流、挤占 fallbackToReply 的预留名额
+      // 否则正文段落后的场景切换仍会另起新流、挤占 fallbackToReply 的预留名额（被动模式）
       if (this.sceneStreamsOpened >= this.opts.maxScenes || this.streamOpensExhausted()) {
         await this.sendSceneProactive(scene, vars)
         return
@@ -622,13 +638,14 @@ export class StreamSession {
     return sendStreamMessage(token, this.opts.ctx.userId, shard, this.fetchImpl)
   }
 
-  /** 占位流+正文流的总开流预算是否已用尽（算术见 MAX_STREAM_OPENS） */
+  /** 占位流+正文流的总开流预算是否已用尽（算术见 MAX_STREAM_OPENS_*） */
   private streamOpensExhausted(): boolean {
-    return this.sceneStreamsOpened + this.bodyStreamsOpened >= MAX_STREAM_OPENS
+    return this.sceneStreamsOpened + this.bodyStreamsOpened >= this.maxStreamOpens
   }
 
   /**
-   * 另起新流：首片 replace/state1/index0，带 msg_id 被动锚定；msg_seq 本流内复用。
+   * 另起新流：首片 replace/state1/index0；被动模式带 msg_id 被动锚定，主动模式省略 msg_id
+   * （走主动消息通道，不占被动预算）；msg_seq 两种模式都携带且本流内复用。
    * 频控（50002/HTTP 429）按官方策略重试：最多 3 次、指数退避。首片重试保持 index0
    * （msg_id+msg_seq 去重锚定；index>0 需要 stream_msg_id，而失败响应不携带）。
    */
@@ -643,7 +660,7 @@ export class StreamSession {
           inputMode: "replace",
           inputState: 1,
           contentType: STREAM_CONTENT_TYPE,
-          msgId: this.opts.ctx.msgId,
+          msgId: this.shardMsgId,
           msgSeq: this.msgSeq,
         })
         this.streamMsgId = res.id
@@ -673,7 +690,7 @@ export class StreamSession {
       inputState: 10,
       contentType: STREAM_CONTENT_TYPE,
       streamMsgId: this.streamMsgId,
-      msgId: this.opts.ctx.msgId,
+      msgId: this.shardMsgId,
       msgSeq: this.msgSeq,
     })
     this.streamMsgId = null
@@ -699,7 +716,7 @@ export class StreamSession {
           inputState: state,
           contentType: STREAM_CONTENT_TYPE,
           streamMsgId: this.streamMsgId,
-          msgId: this.opts.ctx.msgId,
+          msgId: this.shardMsgId,
           msgSeq: this.msgSeq,
         })
         this.streamMsgId = res.id
@@ -788,7 +805,7 @@ export class StreamSession {
         // finish 比对必然失败 → bridge 走 fallbackToReply 全量兜底（被动名额已预留），内容不丢
         if (!this.bodyBudgetLogged) {
           this.bodyBudgetLogged = true
-          console.error(`[stream] 开流预算用尽（占位+正文 ≥ ${MAX_STREAM_OPENS}），正文仅缓冲，收尾走全量兜底`)
+          console.error(`[stream] 开流预算用尽（占位+正文 ≥ ${this.maxStreamOpens}），正文仅缓冲，收尾走全量兜底`)
         }
         return
       }
@@ -889,7 +906,7 @@ export class StreamSession {
             inputState: 1,
             contentType: STREAM_CONTENT_TYPE,
             streamMsgId: this.streamMsgId,
-            msgId: this.opts.ctx.msgId,
+            msgId: this.shardMsgId,
             msgSeq: this.msgSeq,
           })
           this.streamMsgId = res.id

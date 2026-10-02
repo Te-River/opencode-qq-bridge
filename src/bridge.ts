@@ -189,6 +189,7 @@ export function createBridge(
           intervalMs: config.streaming.intervalMs,
           chunkSize: config.streaming.chunkSize,
           maxScenes: config.streaming.maxScenes,
+          proactive: config.streaming.proactive,
         })
       : null
 

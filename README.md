@@ -174,6 +174,7 @@ systemctl --user enable --now openqq.service
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `STREAMING` | `off` | 流式输出开关（`on`/`off`），仅私聊生效 |
+| `STREAMING_PROACTIVE` | `on` | 流式开流走主动消息通道（`on`/`off`）：不占被动回复预算，需用户在 QQ 客户端开启「允许主动消息」，失败自动回退被动 |
 | `STREAMING_INTERVAL_MS` | `500` | 任意两次流式发送的最小间隔（防频控，对齐官方 SDK 默认节流） |
 | `STREAMING_CHUNK_SIZE` | `500` | 兼容保留（replace 全量模式下不再切分正文单片） |
 | `STREAMING_MAX_SCENES` | `3` | 占位流条数上限（占位流+正文流共享被动回复 4 次预算） |
@@ -279,8 +280,10 @@ systemctl --user enable --now openqq.service
   重试耗尽则跳帧不推进已下发基准，收尾比对失败自动回退全文。
 - **思考标签剥离**：正文下发前剥离 `<thinking>`、`<system-reminder>`、`<previous_response>`
   及 deepseek 反引号风格等模型思考标签（官方 sanitize 同款）。
-- **被动回复预算**：QQ 限制单条消息最多被动回复 4 次，占位流与正文流共享该预算，
-  因此 `STREAMING_MAX_SCENES` 默认 3；预算用尽后进度改走主动消息，正文流不受影响。
+- **被动回复预算**：QQ 限制单条消息最多被动回复 4 次。默认 `STREAMING_PROACTIVE=on` 时
+  开流走主动消息通道（不带 `msg_id`），不占被动预算（开流上限放宽为 10，受主动消息
+  20 条/分钟频控约束），兜底被动回复恒有名额；`STREAMING_PROACTIVE=off` 时占位流与
+  正文流共享被动预算，`STREAMING_MAX_SCENES` 默认 3，预算用尽后进度改走主动消息。
 - **需真机验证**：流式接口的分片协议（终片形状、`msg_seq` 复用、40007 前缀约束）
   依据官方文档实现，沙箱/文档未覆盖的行为均已按可回退分支设计，建议先在小范围验证。
 

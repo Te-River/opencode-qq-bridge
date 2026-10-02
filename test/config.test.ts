@@ -6,7 +6,7 @@ const ENV_KEYS = [
   "QQ_APP_ID", "QQ_APP_SECRET", "QQ_SANDBOX",
   "ALLOWED_USERS", "MAX_REPLY_LENGTH",
   "OPENCODE_BASE_URL", "OPENCODE_WORKSPACE",
-  "STREAMING", "STREAMING_INTERVAL_MS", "STREAMING_CHUNK_SIZE", "STREAMING_MAX_SCENES",
+  "STREAMING", "STREAMING_PROACTIVE", "STREAMING_INTERVAL_MS", "STREAMING_CHUNK_SIZE", "STREAMING_MAX_SCENES",
   "PROGRESS", "PROGRESS_MAX", "PROGRESS_MIN_INTERVAL_MS", "PROGRESS_HEARTBEAT_MS",
   "PROGRESS_TEXT_MAX", "PROGRESS_TOOL_CALL", "PROGRESS_TOOL_RESULT", "PROGRESS_TOOL_RESULT_MAX",
   "TEXT_WAITING", "TEXT_TOOL_CALL", "TEXT_TOOL_RESULT", "TEXT_TOOL_FAILED",
@@ -34,9 +34,10 @@ afterEach(() => {
 })
 
 describe("loadConfig streaming 默认值", () => {
-  test("STREAMING 默认 off，intervalMs 500 / chunkSize 500 / maxScenes 3", () => {
+  test("STREAMING 默认 off，proactive 默认 on，intervalMs 500 / chunkSize 500 / maxScenes 3", () => {
     const c = loadConfig()
     expect(c.streaming.enabled).toBe(false)
+    expect(c.streaming.proactive).toBe(true)
     expect(c.streaming.intervalMs).toBe(500)
     expect(c.streaming.chunkSize).toBe(500)
     expect(c.streaming.maxScenes).toBe(3)
@@ -48,6 +49,12 @@ describe("loadConfig streaming 默认值", () => {
   test("STREAMING=off 保持关闭", () => {
     process.env.STREAMING = "off"
     expect(loadConfig().streaming.enabled).toBe(false)
+  })
+  test("STREAMING_PROACTIVE=off 关闭主动开流（大小写不敏感），=on 显式开启", () => {
+    process.env.STREAMING_PROACTIVE = "OFF"
+    expect(loadConfig().streaming.proactive).toBe(false)
+    process.env.STREAMING_PROACTIVE = "on"
+    expect(loadConfig().streaming.proactive).toBe(true)
   })
   test("STREAMING_INTERVAL_MS / CHUNK_SIZE / MAX_SCENES 覆盖", () => {
     process.env.STREAMING_INTERVAL_MS = "250"
