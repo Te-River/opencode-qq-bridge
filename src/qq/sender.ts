@@ -182,6 +182,22 @@ export function detectUrlFileType(url: string): number {
   return 4
 }
 
+/** URL 形式 sendfile 的 file_name 推导：取 pathname 的 basename（剥查询串/锚点），decode 失败用原值；basename 为空返回 undefined */
+export function urlFileName(rawUrl: string): string | undefined {
+  let name: string
+  try {
+    name = new URL(rawUrl).pathname.split("/").pop() ?? ""
+  } catch {
+    name = rawUrl.split(/[?#]/, 1)[0].split("/").pop() ?? ""
+  }
+  if (!name) return undefined
+  try {
+    return decodeURIComponent(name)
+  } catch {
+    return name
+  }
+}
+
 /**
  * 把本机文件或公网 URL 发送给 QQ 用户/群（先上传富媒体，再发 msg_type=7 消息，作为被动回复关联原消息）。
  * http(s) URL 走官方 URL 上传：平台自动下载转存，跳过本地读取与 SEND_FILE_MAX_BYTES 体积检查（大小限制由平台侧处理）。
@@ -194,12 +210,13 @@ export async function sendFileToQQ(
 ): Promise<void> {
   if (isHttpUrl(filePath)) {
     const fileType = detectUrlFileType(filePath)
+    const fileName = urlFileName(filePath)
     const msgSeq = getNextMsgSeq(ctx.msgId)
     if (ctx.type === "group" && ctx.groupId) {
-      const fileInfo = await uploadGroupFileByUrl(accessToken, ctx.groupId, { fileType, url: filePath })
+      const fileInfo = await uploadGroupFileByUrl(accessToken, ctx.groupId, { fileType, url: filePath, fileName })
       await sendGroupMediaMessage(accessToken, ctx.groupId, fileInfo, ctx.msgId, msgSeq)
     } else {
-      const fileInfo = await uploadC2CFileByUrl(accessToken, ctx.userId, { fileType, url: filePath })
+      const fileInfo = await uploadC2CFileByUrl(accessToken, ctx.userId, { fileType, url: filePath, fileName })
       await sendC2CMediaMessage(accessToken, ctx.userId, fileInfo, ctx.msgId, msgSeq)
     }
     return

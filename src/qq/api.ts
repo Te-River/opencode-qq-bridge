@@ -450,7 +450,7 @@ export function uploadGroupFile(accessToken: string, groupOpenid: string, option
 export function uploadC2CFileByUrl(
   accessToken: string,
   openid: string,
-  options: { fileType: number; url: string },
+  options: { fileType: number; url: string; fileName?: string },
 ): Promise<string> {
   return uploadFile(accessToken, `/v2/users/${openid}/files`, options)
 }
@@ -459,7 +459,7 @@ export function uploadC2CFileByUrl(
 export function uploadGroupFileByUrl(
   accessToken: string,
   groupOpenid: string,
-  options: { fileType: number; url: string },
+  options: { fileType: number; url: string; fileName?: string },
 ): Promise<string> {
   return uploadFile(accessToken, `/v2/groups/${groupOpenid}/files`, options)
 }

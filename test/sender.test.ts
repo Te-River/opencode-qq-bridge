@@ -818,6 +818,7 @@ describe("sendFileToQQ", () => {
     expect(calls[0].body).toEqual({
       file_type: 1,
       url: "https://cdn.example.com/pic.png?w=2",
+      file_name: "pic.png",
       srv_send_msg: false,
     })
     expect(calls[1].url).toBe("https://api.sgroup.qq.com/v2/users/U1/messages")
@@ -837,6 +838,29 @@ describe("sendFileToQQ", () => {
     expect(calls[1].url).toBe("https://api.sgroup.qq.com/v2/groups/G1/messages")
     expect(calls[1].body.msg_type).toBe(7)
     expect(calls[1].body.msg_id).toBe("MID1")
+  })
+
+  test("URL 分支 file_name 推导：中文/空格/查询串 → decode 后的 basename", async () => {
+    const { calls, fetchImpl } = mediaRecorder()
+    globalThis.fetch = fetchImpl
+    await sendFileToQQ("tok", c2cCtx(), "https://a.com/p/图片%20v2.png?x=1", 0)
+    expect(calls[0].body.file_name).toBe("图片 v2.png")
+    expect(calls[0].body.url).toBe("https://a.com/p/图片%20v2.png?x=1")
+  })
+
+  test("URL 分支 file_name 推导：非法百分号编码 → 容错用原值", async () => {
+    const { calls, fetchImpl } = mediaRecorder()
+    globalThis.fetch = fetchImpl
+    await sendFileToQQ("tok", c2cCtx(), "https://a.com/p/%E4%80.png", 0)
+    expect(calls[0].body.file_name).toBe("%E4%80.png")
+  })
+
+  test("URL 分支 basename 为空（https://a.com/）→ 请求体无 file_name 字段", async () => {
+    const { calls, fetchImpl } = mediaRecorder()
+    globalThis.fetch = fetchImpl
+    await sendFileToQQ("tok", c2cCtx(), "https://a.com/", 0)
+    expect(calls[0].body.file_type).toBe(4)
+    expect(calls[0].body).not.toHaveProperty("file_name")
   })
 
   test("本地路径分支回归：仍走 base64 上传 + 体积检查", async () => {

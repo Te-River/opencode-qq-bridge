@@ -269,6 +269,19 @@ describe("URL 上传（uploadC2CFileByUrl / uploadGroupFileByUrl）", () => {
       srv_send_msg: false,
     })
   })
+  test("fileName 存在 → 请求体带 file_name（中文/空格原样透传）", async () => {
+    await uploadC2CFileByUrl(TOKEN, OPENID, { fileType: 1, url: "https://cdn.example.com/a.png", fileName: "图片 v2.png" })
+    expect(urlCalls[0].body).toEqual({
+      file_type: 1,
+      url: "https://cdn.example.com/a.png",
+      file_name: "图片 v2.png",
+      srv_send_msg: false,
+    })
+  })
+  test("fileName 为 undefined → 请求体无 file_name 字段", async () => {
+    await uploadGroupFileByUrl(TOKEN, GROUP, { fileType: 4, url: "https://cdn.example.com/doc.pdf", fileName: undefined })
+    expect(urlCalls[0].body).not.toHaveProperty("file_name")
+  })
   test("响应缺 file_info → 抛上传失败错误", async () => {
     globalThis.fetch = (async () => jsonResponse({ file_uuid: "u" })) as typeof fetch
     let caught: unknown
