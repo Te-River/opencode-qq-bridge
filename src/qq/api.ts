@@ -367,6 +367,7 @@ export async function sendC2CMessage(
 
 /**
  * 发送 C2C 输入状态提示，告诉用户机器人正在输入。
+ * msgId 可选：省略时不占被动回复预算（带上 msg_id 会按被动回复计费，挤占流式开流额度）。
  */
 export async function sendC2CInputNotify(
   accessToken: string,

@@ -1,6 +1,6 @@
 // bridge.test.ts — 桥接层回归：STREAMING=off 黄金文案 / PROGRESS_TOOL_CALL 门控 / 群聊不走流式 / 流式接线
 import "./setup-env.js"
-import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test"
 import { createBridge } from "../src/bridge.js"
 import type { Config } from "../src/config.js"
 import type { EventRouter } from "../src/opencode/events.js"
@@ -63,7 +63,11 @@ class FakeRouter {
 }
 
 function makeConfig(
-  over: { streaming?: Partial<Config["streaming"]>; progress?: Partial<Config["progress"]> } = {},
+  over: {
+    streaming?: Partial<Config["streaming"]>
+    progress?: Partial<Config["progress"]>
+    inputNotify?: Partial<Config["inputNotify"]>
+  } = {},
 ): Config {
   return {
     qq: { appId: "app1", clientSecret: "sec", sandbox: false },
@@ -82,6 +86,8 @@ function makeConfig(
       toolResultMax: 300,
       ...over.progress,
     },
+    // 默认 off：既有用例按 URL 断言 /messages 调用数，输入状态用例显式开启
+    inputNotify: { enabled: false, seconds: 10, ...over.inputNotify },
     texts: {},
   }
 }
@@ -308,5 +314,118 @@ describe("bridge STREAMING=on（C2C）", () => {
     expect(streamed).not.toContain("内部推理")
     // finish 基准 = 剥思考标签后的文本 → 比对成功，不发全量回复
     expect(apiCalls.filter((c) => c.url.endsWith("/v2/users/U1/messages"))).toHaveLength(0)
+  })
+})
+
+// ---- 输入中状态（INPUT_NOTIFY）-----------------------------------------------
+
+describe("bridge 输入中状态（INPUT_NOTIFY，仅私聊）", () => {
+  test("回合开始发 msg_type=6（不带 msg_id），回复投递后 stop() 发 input_second=1", async () => {
+    const router = new FakeRouter()
+    const bridge = createBridge(
+      makeConfig({ inputNotify: { enabled: true } }),
+      makeClient(),
+      router as unknown as EventRouter,
+      makeSessions(),
+    )
+    await runConversation(bridge, router, c2cCtx(), [
+      ev("session.text.started"),
+      ev("session.text.delta", { delta: "答案" }),
+      ev("session.text.ended", { text: "答案" }),
+      ev("session.idle"),
+    ])
+    // stop() 的终止提示到达 = finally 已执行完
+    await waitFor(() => apiCalls.some((c) => c.body?.msg_type === 6 && c.body?.input_notify?.input_second === 1))
+    const notifies = apiCalls.filter((c) => c.body?.msg_type === 6)
+    // 回合毫秒级完成，8s 续发间隔不触发：只有首发 + 终止
+    expect(notifies).toHaveLength(2)
+    for (const n of notifies) {
+      expect(n.url.endsWith("/v2/users/U1/messages")).toBe(true)
+      expect("msg_id" in n.body).toBe(false) // 不带 msg_id：不占被动回复预算
+      expect(n.body.input_notify).toMatchObject({ input_type: 1 })
+    }
+    expect(notifies[0].body.input_notify).toEqual({ input_type: 1, input_second: 10 })
+    expect(notifies[1].body.input_notify).toEqual({ input_type: 1, input_second: 1 })
+    // 首发先于最终回复（回合开始即提示，且不依赖回复完成）
+    const firstNotify = apiCalls.findIndex((c) => c.body?.msg_type === 6)
+    const reply = apiCalls.findIndex((c) => c.body?.msg_id === "MID1")
+    expect(firstNotify).toBeGreaterThanOrEqual(0)
+    expect(firstNotify).toBeLessThan(reply)
+  })
+
+  test("input_notify 发送失败：不影响回合，错误仅记录一次", async () => {
+    const router = new FakeRouter()
+    // 首发/续发返回 500；stop() 的终止提示（input_second=1）放行，作为回合结束的确定性标记
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      const u = String(url)
+      if (u.includes("getAppAccessToken")) {
+        return new Response(JSON.stringify({ access_token: "tok", expires_in: 7200 }), { status: 200 })
+      }
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {}
+      apiCalls.push({ url: u, body })
+      if (body.msg_type === 6 && (body.input_notify as { input_second?: number } | undefined)?.input_second !== 1) {
+        return new Response(JSON.stringify({ message: "boom" }), { status: 500 })
+      }
+      return new Response(JSON.stringify({ id: "mid", timestamp: 1 }), { status: 200 })
+    }) as typeof fetch
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => {})
+    try {
+      const bridge = createBridge(
+        makeConfig({ inputNotify: { enabled: true } }),
+        makeClient(),
+        router as unknown as EventRouter,
+        makeSessions(),
+      )
+      await runConversation(bridge, router, c2cCtx(), [
+        ev("session.text.started"),
+        ev("session.text.delta", { delta: "答案" }),
+        ev("session.text.ended", { text: "答案" }),
+        ev("session.idle"),
+      ])
+      // 回合正常完成：最终回复照常投递（失败被忽略）
+      await waitFor(() => apiCalls.some((c) => c.body?.msg_id === "MID1"))
+      await waitFor(() => apiCalls.some((c) => c.body?.msg_type === 6 && c.body?.input_notify?.input_second === 1))
+      const errors = errSpy.mock.calls.filter((c) => String(c[0]).includes("[input-notify]"))
+      expect(errors).toHaveLength(1) // 防刷屏：只记录一次
+    } finally {
+      errSpy.mockRestore()
+    }
+  })
+
+  test("群聊零 input_notify 调用", async () => {
+    const router = new FakeRouter()
+    const bridge = createBridge(
+      makeConfig({ inputNotify: { enabled: true } }),
+      makeClient(),
+      router as unknown as EventRouter,
+      makeSessions(),
+    )
+    const ctx: MessageContext = { type: "group", userId: "U1", groupId: "G1", msgId: "MID1", content: "你好" }
+    await runConversation(bridge, router, ctx, [
+      ev("session.text.started"),
+      ev("session.text.delta", { delta: "群聊回复" }),
+      ev("session.text.ended", { text: "群聊回复" }),
+      ev("session.idle"),
+    ])
+    await waitFor(() => apiCalls.some((c) => c.url.includes("/v2/groups/G1/messages") && c.body?.msg_id === "MID1"))
+    expect(apiCalls.filter((c) => c.body?.msg_type === 6)).toHaveLength(0)
+  })
+
+  test("INPUT_NOTIFY=off：零 input_notify 调用", async () => {
+    const router = new FakeRouter()
+    const bridge = createBridge(
+      makeConfig({ inputNotify: { enabled: false } }),
+      makeClient(),
+      router as unknown as EventRouter,
+      makeSessions(),
+    )
+    await runConversation(bridge, router, c2cCtx(), [
+      ev("session.text.started"),
+      ev("session.text.delta", { delta: "答案" }),
+      ev("session.text.ended", { text: "答案" }),
+      ev("session.idle"),
+    ])
+    await waitFor(() => apiCalls.some((c) => c.body?.msg_id === "MID1"))
+    expect(apiCalls.filter((c) => c.body?.msg_type === 6)).toHaveLength(0)
   })
 })

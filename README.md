@@ -178,6 +178,13 @@ systemctl --user enable --now openqq.service
 | `STREAMING_CHUNK_SIZE` | `500` | 兼容保留（replace 全量模式下不再切分正文单片） |
 | `STREAMING_MAX_SCENES` | `3` | 占位流条数上限（占位流+正文流共享被动回复 4 次预算） |
 
+### 输入中状态
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `INPUT_NOTIFY` | `on` | 私聊「正在输入」状态开关（`on`/`off`），仅私聊生效，独立于 `STREAMING` |
+| `INPUT_NOTIFY_SECONDS` | `10` | 「正在输入」单次提示时长（秒），自动钳制到上限 60 |
+
 ### 分场景文案（可选）
 
 | 变量 | 默认 | 说明 |
