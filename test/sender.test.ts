@@ -394,7 +394,7 @@ describe("StreamSession 每片携带 msg_id", () => {
   })
 })
 
-// ---- 主动开流通道（STREAMING_PROACTIVE，默认 on） ------------------------------
+// ---- 主动开流通道（STREAMING_PROACTIVE，默认 off） ------------------------------
 
 describe("StreamSession 主动开流（proactive）", () => {
   test("proactive=on：首片省略 msg_id（主动通道），msg_seq 保留，续片/终片同样不带 msg_id", async () => {
