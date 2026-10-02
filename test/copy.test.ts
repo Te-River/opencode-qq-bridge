@@ -20,8 +20,8 @@ describe("DEFAULT_COPY 黄金值", () => {
   test("HEARTBEAT 与 bridge 现行硬编码逐字一致", () => {
     expect(DEFAULT_COPY.HEARTBEAT).toBe("⏳ 仍在处理中（已用 {min} 分 {sec} 秒）…")
   })
-  test("WAITING 默认为 请等待中{dots}", () => {
-    expect(DEFAULT_COPY.WAITING).toBe("请等待中{dots}")
+  test("WAITING 默认为 请稍候{dots}", () => {
+    expect(DEFAULT_COPY.WAITING).toBe("请稍候{dots}")
   })
   test("PERMISSION 默认为 🔒 需要授权：{title}", () => {
     expect(DEFAULT_COPY.PERMISSION).toBe("🔒 需要授权：{title}")
@@ -49,8 +49,8 @@ describe("renderCopy 插值", () => {
     expect(renderCopy("HEARTBEAT", { min: 0, sec: 0 })).toBe("⏳ 仍在处理中（已用 0 分 0 秒）…")
   })
   test("WAITING 插值动画帧", () => {
-    expect(renderCopy("WAITING", { dots: "" })).toBe("请等待中")
-    expect(renderCopy("WAITING", { dots: "..." })).toBe("请等待中...")
+    expect(renderCopy("WAITING", { dots: "" })).toBe("请稍候")
+    expect(renderCopy("WAITING", { dots: "..." })).toBe("请稍候...")
   })
   test("PERMISSION 插值标题", () => {
     expect(renderCopy("PERMISSION", { title: "写文件" })).toBe("🔒 需要授权：写文件")

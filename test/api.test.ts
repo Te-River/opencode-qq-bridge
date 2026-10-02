@@ -102,7 +102,7 @@ describe("sendStreamMessage 首片请求体", () => {
 })
 
 describe("sendStreamMessage 后续分片", () => {
-  test("第二片携带 stream_msg_id=首片响应 id 且 index:1，无 msg_id", async () => {
+  test("第二片携带 stream_msg_id=首片响应 id 且 index:1，msg_id 每片必带（官方 SDK 语义）", async () => {
     const first = await sendStreamMessage(TOKEN, OPENID, firstShard())
     await sendStreamMessage(TOKEN, OPENID, {
       content: "世界",
@@ -110,6 +110,7 @@ describe("sendStreamMessage 后续分片", () => {
       inputMode: "append",
       inputState: 1,
       streamMsgId: first.id,
+      msgId: "MID1",
       msgSeq: 42,
     })
     expect(calls).toHaveLength(2)
@@ -120,6 +121,7 @@ describe("sendStreamMessage 后续分片", () => {
       input_state: 1,
       content_type: "text",
       msg_seq: 42,
+      msg_id: "MID1",
       stream_msg_id: "resp-1",
     })
   })

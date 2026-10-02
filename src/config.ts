@@ -22,7 +22,7 @@ export interface ProgressConfig {
 /** 流式输出（实验性，仅私聊生效） */
 export interface StreamingConfig {
   enabled: boolean // STREAMING，默认 off
-  intervalMs: number // STREAMING_INTERVAL_MS，默认 1500（任意两次 HTTP 发送最小间隔）
+  intervalMs: number // STREAMING_INTERVAL_MS，默认 500（对齐官方 SDK DEFAULT_THROTTLE_MS；任意两次 HTTP 发送最小间隔）
   chunkSize: number // STREAMING_CHUNK_SIZE，默认 500（正文单片最大字符数）
   maxScenes: number // STREAMING_MAX_SCENES，默认 3（占位流条数上限：占位流+正文流共享被动回复 4 次预算）
 }
@@ -107,11 +107,11 @@ export async function ensureConfig(): Promise<void> {
     `ALLOWED_USERS=`,
     `MAX_REPLY_LENGTH=3000`,
     `# STREAMING=off`,
-    `# STREAMING_INTERVAL_MS=1500`,
+    `# STREAMING_INTERVAL_MS=500`,
     `# STREAMING_CHUNK_SIZE=500`,
     `# STREAMING_MAX_SCENES=3`,
     `# PROGRESS_TOOL_CALL=on`,
-    `# TEXT_WAITING=请等待中{dots}`,
+    `# TEXT_WAITING=请稍候{dots}`,
     `# TEXT_TOOL_CALL=🔧 调用工具：{tool}`,
     `# TEXT_TOOL_RESULT=📄 {tool} 返回：{result}`,
     `# TEXT_TOOL_FAILED=❌ 工具失败：{error}`,
@@ -181,7 +181,7 @@ export function loadConfig(): Config {
     maxReplyLength: parseInt(process.env.MAX_REPLY_LENGTH ?? "3000", 10),
     streaming: {
       enabled: (process.env.STREAMING ?? "off").toLowerCase() === "on",
-      intervalMs: parseInt(process.env.STREAMING_INTERVAL_MS ?? "1500", 10),
+      intervalMs: parseInt(process.env.STREAMING_INTERVAL_MS ?? "500", 10),
       chunkSize: parseInt(process.env.STREAMING_CHUNK_SIZE ?? "500", 10),
       maxScenes: parseInt(process.env.STREAMING_MAX_SCENES ?? "3", 10),
     },

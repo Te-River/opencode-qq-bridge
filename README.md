@@ -174,7 +174,7 @@ systemctl --user enable --now openqq.service
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `STREAMING` | `off` | 流式输出开关（`on`/`off`），仅私聊生效 |
-| `STREAMING_INTERVAL_MS` | `1500` | 任意两次流式发送的最小间隔（防频控） |
+| `STREAMING_INTERVAL_MS` | `500` | 任意两次流式发送的最小间隔（防频控，对齐官方 SDK 默认节流） |
 | `STREAMING_CHUNK_SIZE` | `500` | 兼容保留（replace 全量模式下不再切分正文单片） |
 | `STREAMING_MAX_SCENES` | `3` | 占位流条数上限（占位流+正文流共享被动回复 4 次预算） |
 
@@ -182,7 +182,7 @@ systemctl --user enable --now openqq.service
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `TEXT_WAITING` | `请等待中{dots}` | 等待占位文案（`{dots}` 为动画点） |
+| `TEXT_WAITING` | `请稍候{dots}` | 等待占位文案（`{dots}` 为动画点） |
 | `TEXT_TOOL_CALL` | `🔧 调用工具：{tool}` | 工具调用进度 |
 | `TEXT_TOOL_RESULT` | `📄 {tool} 返回：{result}` | 工具返回摘要 |
 | `TEXT_TOOL_FAILED` | `❌ 工具失败：{error}` | 工具失败提示 |
@@ -259,7 +259,7 @@ systemctl --user enable --now openqq.service
 
 ## 流式输出（实验性）
 
-`STREAMING=on` 后，私聊回复改为 QQ 官方**流式消息**：先发「请等待中…」占位气泡（点号动画），
+`STREAMING=on` 后，私聊回复改为 QQ 官方**流式消息**：先发「请稍候…」占位气泡（点号动画），
 随后按场景切换文案（工具调用 / 返回摘要 / 心跳等），AI 正文产出时每帧以
 `input_mode=replace` 携带**当前累计全文**更新正文气泡（官方 SDK 同款语义）。
 

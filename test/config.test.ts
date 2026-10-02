@@ -34,10 +34,10 @@ afterEach(() => {
 })
 
 describe("loadConfig streaming 默认值", () => {
-  test("STREAMING 默认 off，intervalMs 1500 / chunkSize 500 / maxScenes 3", () => {
+  test("STREAMING 默认 off，intervalMs 500 / chunkSize 500 / maxScenes 3", () => {
     const c = loadConfig()
     expect(c.streaming.enabled).toBe(false)
-    expect(c.streaming.intervalMs).toBe(1500)
+    expect(c.streaming.intervalMs).toBe(500)
     expect(c.streaming.chunkSize).toBe(500)
     expect(c.streaming.maxScenes).toBe(3)
   })

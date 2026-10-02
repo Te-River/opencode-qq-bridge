@@ -241,11 +241,13 @@ describe("bridge STREAMING=on（C2C）", () => {
     await waitFor(() => apiCalls.filter((c) => c.url.includes("stream_messages")).length >= 4)
     const ss = apiCalls.filter((c) => c.url.includes("stream_messages")).map((c) => c.body)
     expect(ss).toHaveLength(4)
-    expect(ss[0]).toMatchObject({ content_raw: "请等待中", index: 0, input_mode: "replace", input_state: 1, msg_id: "MID1" })
+    expect(ss[0]).toMatchObject({ content_raw: "请稍候", index: 0, input_mode: "replace", input_state: 1, msg_id: "MID1" })
     expect(ss[1]).toMatchObject({ input_mode: "append", input_state: 10 })
     expect(ss[2]).toMatchObject({ content_raw: body, index: 0, input_mode: "replace", input_state: 1, msg_id: "MID1" })
     // 正文终片 = replace + 全量 + state10（官方 update() 全文语义）
     expect(ss[3]).toMatchObject({ content_raw: body, input_mode: "replace", input_state: 10 })
+    // 每片都携带 msg_id（官方 SDK 语义，真机续片缺 msg_id 报 50015001）
+    expect(ss.every((x) => x.msg_id === "MID1")).toBe(true)
     // 同一流 msg_seq 恒定
     expect(ss[0].msg_seq).toBe(ss[1].msg_seq)
     expect(ss[2].msg_seq).toBe(ss[3].msg_seq)

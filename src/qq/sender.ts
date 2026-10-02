@@ -199,7 +199,7 @@ export async function sendFileToQQ(
 // 流式会话（实验性，仅 C2C）
 // ---------------------------------------------------------------------------
 
-/** 正文累计达到该长度才允许 flush（内部常量，不设 env） */
+/** 正文累计达到该长度才开正文流（短回复不开流直接走普通回复；内部常量，不设 env） */
 const MIN_FLUSH_CHARS = 24
 
 /** 频控重试上限与指数退避基数（官方 streaming.ts：50002/HTTP 429 最多 3 次重试，1000/2000/4000ms） */
@@ -208,8 +208,9 @@ const RATE_LIMIT_BACKOFF_BASE_MS = 1000
 
 /**
  * 开流总次数上限（占位流 + 正文流合并核算）。
- * 算术：QQ 单聊被动回复每个 msg_id 最多 4 次；每次 openStream（新流首片带 msg_id + 新
- * msg_seq）消耗一个名额，流内后续分片共享同 msg_seq 不消耗。fallbackToReply 的全量兜底
+ * 算术：QQ 单聊被动回复每个 msg_id 最多 4 次；每个分片都带 msg_id（官方 SDK 语义，
+ * 真机实测缺 msg_id 的续片报 50015001），但去重锚定为 msg_id+msg_seq——openStream 换新
+ * msg_seq 才消耗名额，流内后续分片共享同 msg_seq 不消耗。fallbackToReply 的全量兜底
  * 同为该 msg_id 的被动回复，保守预留 1 个名额 ⇒ 占位 + 正文的总开流次数 ≤ 4 - 1 = 3。
  * 用尽后：场景文案走主动消息（与 maxScenes 用尽同款降级），正文只缓冲不发送，
  * finish 比对失败 → bridge 全量兜底，内容不丢、预算不超。
@@ -452,7 +453,8 @@ export class StreamSession {
   }
 
   /**
-   * 正文增量：累计进全量缓冲，节流后以 replace+全量分片下发（达到 minFlush 才发）。
+   * 正文增量：累计进全量缓冲，节流窗口到了且文本有变化就以 replace+全量分片下发
+   * （官方语义，无增量字符门槛；开流仍需满 MIN_FLUSH_CHARS）。
    * [[sendfile:...]] 标记与思考标签在 flush 时对全量文本统一剥离：完整标记/标签块直接删掉；
    * 尾部疑似未闭合的片段扣留给后续 delta 补全，避免半截标记/标签闪现（文件由 bridge 的
    * deliverResult 单独发送，不走流式正文）。
@@ -600,6 +602,7 @@ export class StreamSession {
       inputState: 10,
       contentType: STREAM_CONTENT_TYPE,
       streamMsgId: this.streamMsgId,
+      msgId: this.opts.ctx.msgId,
       msgSeq: this.msgSeq,
     })
     this.streamMsgId = null
@@ -624,6 +627,7 @@ export class StreamSession {
           inputState: state,
           contentType: STREAM_CONTENT_TYPE,
           streamMsgId: this.streamMsgId,
+          msgId: this.opts.ctx.msgId,
           msgSeq: this.msgSeq,
         })
         this.streamMsgId = res.id
@@ -759,7 +763,6 @@ export class StreamSession {
       await this.endStreamAsFailed()
       return
     }
-    if (!final && sendable.length - this.lastAcceptedFull.length < MIN_FLUSH_CHARS) return
 
     try {
       await this.sendBodyFrame(sendable, final ? 10 : 1)
@@ -812,6 +815,7 @@ export class StreamSession {
             inputState: 1,
             contentType: STREAM_CONTENT_TYPE,
             streamMsgId: this.streamMsgId,
+            msgId: this.opts.ctx.msgId,
             msgSeq: this.msgSeq,
           })
           this.streamMsgId = res.id

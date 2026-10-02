@@ -86,11 +86,11 @@ function baseOpts(
   }
 }
 
-/** 同一条流内所有分片 msg_seq 必须恒定（官方文档语义） */
+/** 同一条流内所有分片 msg_seq 必须恒定（官方文档语义；每片都带 msg_id，新流首片以 index0 识别） */
 function expectMsgSeqConstantPerStream(list: ShardBody[]): void {
   let current: number | null = null
   for (const s of list) {
-    if (s.msg_id !== undefined) current = s.msg_seq // 新流首片
+    if (s.index === 0) current = s.msg_seq // 新流首片
     expect(s.msg_seq).toBe(current)
   }
 }
@@ -130,7 +130,7 @@ describe("StreamSession.start", () => {
     expect(s.state).toBe("streaming")
     const list = shards(calls)
     expect(list).toHaveLength(1)
-    expect(list[0].content_raw).toBe("请等待中")
+    expect(list[0].content_raw).toBe("请稍候")
     expect(list[0].index).toBe(0)
     expect(list[0].input_mode).toBe("replace")
     expect(list[0].input_state).toBe(1)
@@ -263,12 +263,13 @@ describe("StreamSession 开流预算", () => {
     }
     const list = okShards(calls)
     // 开流总数 = WAITING + 预算内 2 段正文 = 3 ≤ MAX_STREAM_OPENS（被动 4 次预留 1 次兜底）
-    const opens = list.filter((x) => x.msg_id !== undefined)
+    // 每片都带 msg_id，开流以 index0 识别
+    const opens = list.filter((x) => x.index === 0)
     expect(opens).toHaveLength(3)
-    expect(opens.map((x) => x.content_raw)).toEqual(["请等待中", A40, B40])
-    // 第 3 段起预算用尽：不再有带 msg_id 的新流首片（后续分片至多复用流内 stream_msg_id）
-    const lastOpenIdx = list.findIndex((x) => x.content_raw === B40 && x.msg_id !== undefined)
-    expect(list.slice(lastOpenIdx + 1).every((x) => x.msg_id === undefined)).toBe(true)
+    expect(opens.map((x) => x.content_raw)).toEqual(["请稍候", A40, B40])
+    // 第 3 段起预算用尽：不再有新开流首片（后续分片至多复用流内 stream_msg_id）
+    const lastOpenIdx = list.findIndex((x) => x.content_raw === B40 && x.index === 0)
+    expect(list.slice(lastOpenIdx + 1).every((x) => x.index > 0)).toBe(true)
     // 超预算段落只缓冲不发送：第 3~5 段正文从未出现在任何流式分片里
     expect(sentText(calls)).not.toContain(C40)
     // 场景降级为主动消息（不带 msg_id，不占被动名额）
@@ -291,7 +292,7 @@ describe("StreamSession 开流预算", () => {
     await s.pushBody(A40)
     await s.switchScene("TEXT", { snippet: "x" })
     await s.pushBody(B40)
-    const opens = okShards(calls).filter((x) => x.msg_id !== undefined)
+    const opens = okShards(calls).filter((x) => x.index === 0)
     // WAITING + 2 段正文 = 3 次开流，均在预算内：重置语义与既有行为一致
     expect(opens).toHaveLength(3)
     expect(opens[2]).toMatchObject({
@@ -347,6 +348,49 @@ describe("StreamSession.pushBody 节流", () => {
   })
 })
 
+// ---- 每片携带 msg_id（真机 50015001 修复：官方 SDK msgId 无条件写入每帧） ------
+
+describe("StreamSession 每片携带 msg_id", () => {
+  test("续片与终片都携带 msg_id（缺 msg_id 的续片真机报 50015001）", async () => {
+    const { calls, fetchImpl } = makeRecorder()
+    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
+    await s.start()
+    await s.pushBody(A40)
+    await s.pushBody(B40) // 续片
+    await s.finish(A40 + B40) // 终片
+    const list = shards(calls)
+    expect(list.length).toBeGreaterThanOrEqual(5)
+    expect(list.every((x) => x.msg_id === "MID1")).toBe(true)
+    // 续片/终片同时携带 stream_msg_id（流内续传）与 msg_id（被动锚定）
+    const cont = list.filter((x) => x.index >= 1)
+    expect(cont.length).toBeGreaterThanOrEqual(2)
+    expect(cont.every((x) => x.stream_msg_id !== undefined && x.msg_id === "MID1")).toBe(true)
+  })
+
+  test("dots 动画帧携带 msg_id", async () => {
+    const { calls, fetchImpl } = makeRecorder()
+    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500), { intervalMs: 1 })))
+    await s.start()
+    await new Promise((r) => setTimeout(r, 50)) // 等 dots timer 触发若干帧
+    const frames = shards(calls).filter((x) => x.index >= 1)
+    expect(frames.length).toBeGreaterThanOrEqual(2)
+    expect(frames.every((x) => x.msg_id === "MID1")).toBe(true)
+    expect(frames.every((x) => x.stream_msg_id !== undefined)).toBe(true)
+  })
+
+  test("增量帧无 24 字符门槛：开流后有变化的 delta 即发帧（官方语义）", async () => {
+    const { calls, fetchImpl } = makeRecorder()
+    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
+    await s.start()
+    await s.pushBody(A40) // 开流（40 ≥ MIN_FLUSH_CHARS）
+    await s.pushBody("x") // 增量 1 字符也发帧
+    const list = okShards(calls)
+    expect(list[3].content_raw).toBe(A40 + "x")
+    expect(list[3].index).toBe(1)
+    expect(list[3].msg_id).toBe("MID1")
+  })
+})
+
 // ---- 错误恢复 -------------------------------------------------------------
 
 describe("StreamSession 错误恢复", () => {
@@ -372,8 +416,8 @@ describe("StreamSession 错误恢复", () => {
     const list = shards(calls)
     // 冲突终片：append+空+state10（不改写已下发内容）
     expect(list[list.length - 1]).toMatchObject({ input_mode: "append", input_state: 10 })
-    // 不再另起新流续传：全部分片中带 msg_id 的新流首片只有 WAITING 与正文 open 两个
-    expect(list.filter((x) => x.msg_id !== undefined)).toHaveLength(2)
+    // 不再另起新流续传：新开流首片（index0）只有 WAITING 与正文 open 两个
+    expect(list.filter((x) => x.index === 0)).toHaveLength(2)
     expect(s.state).toBe("failed")
     expect(s.deliveredBody).toBe(A40) // lastAcceptedFull 停在最后一次成功下发
     // failed 后 finish false（bridge 走全量兜底），后续 pushBody 零请求

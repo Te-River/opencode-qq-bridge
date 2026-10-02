@@ -27,7 +27,7 @@ export interface CopyVars {
 // 默认文案：TOOL_CALL/TOOL_RESULT/TOOL_FAILED/TEXT/HEARTBEAT 与 bridge.ts 现行硬编码逐字一致；
 // WAITING/PERMISSION/BODY 为新增（无现状对照）。
 export const DEFAULT_COPY: Record<Scene, string> = {
-  WAITING: "请等待中{dots}",
+  WAITING: "请稍候{dots}",
   TOOL_CALL: "🔧 调用工具：{tool}",
   TOOL_RESULT: "📄 {tool} 返回：{result}",
   TOOL_FAILED: "❌ 工具失败：{error}",
