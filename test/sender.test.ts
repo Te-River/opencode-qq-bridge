@@ -243,6 +243,70 @@ describe("StreamSession.switchScene", () => {
   })
 })
 
+// ---- 开流预算（占位+正文合并核算，MAX_STREAM_OPENS = 4 - 1 = 3） --------------------------
+
+describe("StreamSession 开流预算", () => {
+  test("[MAJOR] 连续多段 TEXT 重置：开流总数 ≤ 预算，超预算后无 msg_id 新流首片，finish false 且兜底可走", async () => {
+    const { calls, fetchImpl } = makeRecorder()
+    const proactive: Recorded[] = []
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {}
+      proactive.push({ url: String(url), headers: {}, body })
+      return new Response(JSON.stringify({ id: "p1", timestamp: 1 }), { status: 200 })
+    }) as typeof fetch
+    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
+    await s.start() // WAITING：开流 1/3
+    const segs = [A40, B40, C40, "D".repeat(40), "E".repeat(40)]
+    for (const seg of segs) {
+      await s.pushBody(seg)
+      await s.switchScene("TEXT", { snippet: "x" })
+    }
+    const list = okShards(calls)
+    // 开流总数 = WAITING + 预算内 2 段正文 = 3 ≤ MAX_STREAM_OPENS（被动 4 次预留 1 次兜底）
+    const opens = list.filter((x) => x.msg_id !== undefined)
+    expect(opens).toHaveLength(3)
+    expect(opens.map((x) => x.content_raw)).toEqual(["请等待中", A40, B40])
+    // 第 3 段起预算用尽：不再有带 msg_id 的新流首片（后续分片至多复用流内 stream_msg_id）
+    const lastOpenIdx = list.findIndex((x) => x.content_raw === B40 && x.msg_id !== undefined)
+    expect(list.slice(lastOpenIdx + 1).every((x) => x.msg_id === undefined)).toBe(true)
+    // 超预算段落只缓冲不发送：第 3~5 段正文从未出现在任何流式分片里
+    expect(sentText(calls)).not.toContain(C40)
+    // 场景降级为主动消息（不带 msg_id，不占被动名额）
+    expect(proactive.length).toBeGreaterThanOrEqual(1)
+    expect(proactive.every((p) => p.url === "https://api.sgroup.qq.com/v2/users/U1/messages")).toBe(true)
+    // finish 比对失败 → bridge 走全量兜底
+    expect(await s.finish(segs.join(""))).toBe(false)
+    // 兜底路径可走：fallbackToReply 以同 msg_id 被动回复发出全量（第 4 次 = 预留名额）
+    await s.fallbackToReply(segs.join(""))
+    const replies = proactive.filter((p) => p.body.msg_id === "MID1")
+    expect(replies).toHaveLength(1)
+    expect((replies[0].body.markdown as { content: string }).content).toContain(A40)
+    expect((replies[0].body.markdown as { content: string }).content).toContain("E".repeat(40))
+  })
+
+  test("预算内 TEXT 重置行为不变：每段仍另起新流首片（index0/msg_id），deliveredBody 跟随本段", async () => {
+    const { calls, fetchImpl } = makeRecorder()
+    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
+    await s.start()
+    await s.pushBody(A40)
+    await s.switchScene("TEXT", { snippet: "x" })
+    await s.pushBody(B40)
+    const opens = okShards(calls).filter((x) => x.msg_id !== undefined)
+    // WAITING + 2 段正文 = 3 次开流，均在预算内：重置语义与既有行为一致
+    expect(opens).toHaveLength(3)
+    expect(opens[2]).toMatchObject({
+      content_raw: B40,
+      index: 0,
+      input_mode: "replace",
+      input_state: 1,
+      msg_id: "MID1",
+    })
+    expect(s.deliveredBody).toBe(B40)
+    expect(s.state).toBe("streaming")
+    expectMsgSeqConstantPerStream(okShards(calls))
+  })
+})
+
 // ---- 节流与缓冲 -----------------------------------------------------------
 
 describe("StreamSession.pushBody 节流", () => {

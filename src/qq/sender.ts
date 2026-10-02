@@ -206,6 +206,16 @@ const MIN_FLUSH_CHARS = 24
 const RATE_LIMIT_RETRIES = 3
 const RATE_LIMIT_BACKOFF_BASE_MS = 1000
 
+/**
+ * 开流总次数上限（占位流 + 正文流合并核算）。
+ * 算术：QQ 单聊被动回复每个 msg_id 最多 4 次；每次 openStream（新流首片带 msg_id + 新
+ * msg_seq）消耗一个名额，流内后续分片共享同 msg_seq 不消耗。fallbackToReply 的全量兜底
+ * 同为该 msg_id 的被动回复，保守预留 1 个名额 ⇒ 占位 + 正文的总开流次数 ≤ 4 - 1 = 3。
+ * 用尽后：场景文案走主动消息（与 maxScenes 用尽同款降级），正文只缓冲不发送，
+ * finish 比对失败 → bridge 全量兜底，内容不丢、预算不超。
+ */
+const MAX_STREAM_OPENS = 3
+
 /** 等待动画帧序列：前缀单调递增，满足 40007「已下发前缀不可修改」约束 */
 const DOTS_FRAMES = ["", ".", "..", "..."] as const
 
@@ -307,7 +317,7 @@ export interface StreamSessionOptions {
   render: (scene: Scene, vars: CopyVars) => string // bridge 传入绑定 config.texts 的 renderCopy
   intervalMs: number // 任意两次 HTTP 发送的最小间隔
   chunkSize: number // 兼容保留（append 时代的正文单片上限；replace 全量模式下不再切分，配置键不动）
-  maxScenes: number // 占位流条数上限（含首条 WAITING；占位流+正文流共享被动回复 4 次预算）
+  maxScenes: number // 占位流条数上限（含首条 WAITING；另受 MAX_STREAM_OPENS 总开流预算合并约束）
   fetchImpl?: typeof fetch // 测试注入，缺省 globalThis.fetch
   now?: () => number // 测试注入假时钟，缺省 Date.now
 }
@@ -334,6 +344,8 @@ export class StreamSession {
   private nextIndex = 0 // 当前流下一片 index（每条新流重置 0）
   private msgSeq = 0 // 每条新流首片取一次 getNextMsgSeq 并在同流内复用（官方示例同流 msg_seq 恒定）
   private sceneStreamsOpened = 0 // 已开启的占位流条数（含首条 WAITING）
+  private bodyStreamsOpened = 0 // 已开启的正文流条数（TEXT 重置后下段另起新流时递增；与占位流合并受 MAX_STREAM_OPENS 约束）
+  private bodyBudgetLogged = false // 开流预算用尽的降级日志只打一次（避免逐 delta 刷屏）
   private bodyStreamActive = false
   private rawBody = "" // 当前段正文全量累计（未剥离；剥离在 flush 时对全量重算，无「部分消费」状态）
   private lastAcceptedFull = "" // 最后一次成功下发的全量正文（剥离后基准；deliveredBody 的唯一真理源）
@@ -386,7 +398,8 @@ export class StreamSession {
    * 场景切换 = 旧流终片(state10) + 另起新流首片。
    * - 正文流进行中：TEXT 场景=新一段正文（关闭当前正文流，下段另起，不重复发摘要）；
    *   其余场景走主动消息，不打断正文流。
-   * - 占位流预算用尽：场景文案改走主动消息（对齐 STREAMING=off 的进度通道）。
+   * - 占位流预算（maxScenes）或总开流预算（占位+正文合并核算，MAX_STREAM_OPENS）用尽：
+   *   场景文案改走主动消息（对齐 STREAMING=off 的进度通道）。
    * - 新流首片失败：重试 1 次（频控先退避），再败 state=failed 并以主动消息发出场景文案。
    */
   async switchScene(scene: Scene, vars: CopyVars): Promise<void> {
@@ -411,7 +424,9 @@ export class StreamSession {
         return
       }
 
-      if (this.sceneStreamsOpened >= this.opts.maxScenes) {
+      // 占位流条数用 maxScenes 衡量；总开流预算（占位+正文合并核算）用尽时同样降级主动消息，
+      // 否则正文段落后的场景切换仍会带 msg_id 开新流、挤占 fallbackToReply 的预留名额
+      if (this.sceneStreamsOpened >= this.opts.maxScenes || this.streamOpensExhausted()) {
         await this.sendSceneProactive(scene, vars)
         return
       }
@@ -536,6 +551,11 @@ export class StreamSession {
     await this.throttle()
     const token = await this.opts.token()
     return sendStreamMessage(token, this.opts.ctx.userId, shard, this.fetchImpl)
+  }
+
+  /** 占位流+正文流的总开流预算是否已用尽（算术见 MAX_STREAM_OPENS） */
+  private streamOpensExhausted(): boolean {
+    return this.sceneStreamsOpened + this.bodyStreamsOpened >= MAX_STREAM_OPENS
   }
 
   /**
@@ -686,6 +706,15 @@ export class StreamSession {
     if (!this.bodyStreamActive) {
       // 开流门槛：仅非终刷且满 MIN_FLUSH_CHARS 才开正文流（终刷从不开流——未开流的收尾走占位流关闭+空比对）
       if (final || !sendable || sendable.length < MIN_FLUSH_CHARS) return
+      if (this.streamOpensExhausted()) {
+        // 总开流预算用尽：不再开新正文流（占位流保持原样，由 finish 收尾关闭），正文只缓冲；
+        // finish 比对必然失败 → bridge 走 fallbackToReply 全量兜底（被动名额已预留），内容不丢
+        if (!this.bodyBudgetLogged) {
+          this.bodyBudgetLogged = true
+          console.error(`[stream] 开流预算用尽（占位+正文 ≥ ${MAX_STREAM_OPENS}），正文仅缓冲，收尾走全量兜底`)
+        }
+        return
+      }
       if (this.streamMsgId) {
         try {
           await this.closeStream()
@@ -705,6 +734,7 @@ export class StreamSession {
         this.markFailed()
         return
       }
+      this.bodyStreamsOpened++
       this.bodyStreamActive = true
       this.activeScene = "BODY"
       this.lastAcceptedFull = sendable
