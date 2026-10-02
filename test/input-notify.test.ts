@@ -85,14 +85,14 @@ describe("startInputNotify（假时钟）", () => {
     expect(notifyBodies()).toHaveLength(4) // 定时器已清，不再续发
   })
 
-  test("所有调用不带 msg_id、input_type=1；stop() 发 input_second=1", async () => {
+  test("所有调用带 msg_id 被动锚定、input_type=1；stop() 发 input_second=1", async () => {
     const handle = startInputNotify(c2cCtx(), makeConfig())
     await flush()
     await handle.stop()
     const bodies = notifyBodies()
     expect(bodies).toHaveLength(2)
     for (const b of bodies) {
-      expect("msg_id" in b).toBe(false) // 不带 msg_id：不占被动回复预算
+      expect(b.msg_id).toBe("MID1") // 带 msg_id 被动锚定：QQ 渲染为纯状态而非 "null" 气泡
       expect(b.input_notify).toMatchObject({ input_type: 1 })
     }
     expect(bodies[0].input_notify).toEqual({ input_type: 1, input_second: 10 })

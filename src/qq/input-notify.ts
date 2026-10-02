@@ -17,9 +17,10 @@ export interface InputNotifyHandle {
  * - 期间每 input_second × 0.8 续发一次（状态到期前刷新，不留空窗）
  * - stop()：清定时器 + 发 input_second=1 加速消退（该调用失败靠短时长自然过期兜底）
  *
- * 预算安全：所有调用不带 msg_id —— 该端点 msg_id 可选，带上会占被动回复预算，
- * 威胁流式开流预算（MAX_STREAM_OPENS 的算术）。发送失败仅 console.error 一次
- * （防刷屏），不影响回合主流程。
+ * 锚定：所有调用带 msg_id（被动锚定到用户消息）—— 真机实测不带 msg_id 时
+ * QQ 会渲染出一个内容为 "null" 的消息气泡；带上后渲染为纯状态。msg_seq 每次调用
+ * 随机（getNextMsgSeq），去重安全。发送失败仅 console.error 一次（防刷屏），
+ * 不影响回合主流程。
  */
 export function startInputNotify(ctx: MessageContext, config: Config): InputNotifyHandle {
   if (ctx.type !== "c2c" || !config.inputNotify.enabled) {
@@ -34,7 +35,7 @@ export function startInputNotify(ctx: MessageContext, config: Config): InputNoti
   const fire = async (inputSecond: number): Promise<void> => {
     try {
       const token = await getAccessToken(config.qq.appId, config.qq.clientSecret)
-      await sendC2CInputNotify(token, ctx.userId, undefined, inputSecond)
+      await sendC2CInputNotify(token, ctx.userId, ctx.msgId, inputSecond)
     } catch (error) {
       if (!loggedFailure) {
         loggedFailure = true

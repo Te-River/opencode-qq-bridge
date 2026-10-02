@@ -320,7 +320,7 @@ describe("bridge STREAMING=on（C2C）", () => {
 // ---- 输入中状态（INPUT_NOTIFY）-----------------------------------------------
 
 describe("bridge 输入中状态（INPUT_NOTIFY，仅私聊）", () => {
-  test("回合开始发 msg_type=6（不带 msg_id），回复投递后 stop() 发 input_second=1", async () => {
+  test("回合开始发 msg_type=6（带 msg_id 被动锚定），回复投递后 stop() 发 input_second=1", async () => {
     const router = new FakeRouter()
     const bridge = createBridge(
       makeConfig({ inputNotify: { enabled: true } }),
@@ -341,14 +341,14 @@ describe("bridge 输入中状态（INPUT_NOTIFY，仅私聊）", () => {
     expect(notifies).toHaveLength(2)
     for (const n of notifies) {
       expect(n.url.endsWith("/v2/users/U1/messages")).toBe(true)
-      expect("msg_id" in n.body).toBe(false) // 不带 msg_id：不占被动回复预算
+      expect(n.body.msg_id).toBe("MID1") // 带 msg_id 被动锚定：QQ 渲染为纯状态而非 "null" 气泡
       expect(n.body.input_notify).toMatchObject({ input_type: 1 })
     }
     expect(notifies[0].body.input_notify).toEqual({ input_type: 1, input_second: 10 })
     expect(notifies[1].body.input_notify).toEqual({ input_type: 1, input_second: 1 })
     // 首发先于最终回复（回合开始即提示，且不依赖回复完成）
     const firstNotify = apiCalls.findIndex((c) => c.body?.msg_type === 6)
-    const reply = apiCalls.findIndex((c) => c.body?.msg_id === "MID1")
+    const reply = apiCalls.findIndex((c) => c.body?.msg_id === "MID1" && c.body?.msg_type !== 6)
     expect(firstNotify).toBeGreaterThanOrEqual(0)
     expect(firstNotify).toBeLessThan(reply)
   })
@@ -382,8 +382,8 @@ describe("bridge 输入中状态（INPUT_NOTIFY，仅私聊）", () => {
         ev("session.text.ended", { text: "答案" }),
         ev("session.idle"),
       ])
-      // 回合正常完成：最终回复照常投递（失败被忽略）
-      await waitFor(() => apiCalls.some((c) => c.body?.msg_id === "MID1"))
+      // 回合正常完成：最终回复照常投递（失败被忽略；排除 msg_type=6 的 input_notify）
+      await waitFor(() => apiCalls.some((c) => c.body?.msg_id === "MID1" && c.body?.msg_type !== 6))
       await waitFor(() => apiCalls.some((c) => c.body?.msg_type === 6 && c.body?.input_notify?.input_second === 1))
       const errors = errSpy.mock.calls.filter((c) => String(c[0]).includes("[input-notify]"))
       expect(errors).toHaveLength(1) // 防刷屏：只记录一次
