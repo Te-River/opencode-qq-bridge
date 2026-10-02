@@ -5,7 +5,7 @@ import type { Config, ProgressConfig } from "./config.js"
 import { DEFAULT_PROGRESS } from "./config.js"
 import type { MessageContext } from "./qq/types.js"
 import { getAccessToken } from "./qq/api.js"
-import { replyToQQ, sendProactiveToQQ, sendFileToQQ, StreamSession } from "./qq/sender.js"
+import { replyToQQ, sendProactiveToQQ, sendFileToQQ, stripThinkingTags, StreamSession } from "./qq/sender.js"
 import { renderCopy, type Scene, type CopyVars } from "./copy.js"
 import { mkdirSync, writeFileSync } from "fs"
 import { join } from "path"
@@ -241,9 +241,11 @@ export function createBridge(
 
       // 等进度消息都发完，再发最终结果，保证顺序
       await progressChain.catch(() => {})
-      // 比对基准 = 剥离 [[sendfile:...]] 标记后的文本（流式缓冲已剥离同样的标记）。
-      // 不用 extractSendFiles().text：其额外的空白收敛会让不含标记的回复也比对失败
-      const streamedOk = stream ? await stream.finish(replyText.replace(SEND_FILE_RE, "")) : false
+      // 比对基准 = 剥离 [[sendfile:...]] 标记 + 剥思考标签后的文本（与流式缓冲共用同一剥离函数，
+      // 两侧口径一致；不用 extractSendFiles().text：其额外的空白收敛会让不含标记的回复也比对失败）
+      const streamedOk = stream
+        ? await stream.finish(stripThinkingTags(replyText.replace(SEND_FILE_RE, "")))
+        : false
       await deliverResult(ctx, replyText, "reply", streamedOk)
 
       // 本轮结束后继续监视：后台任务完成时 OpenCode 会自动让 AI 继续输出，转发给用户

@@ -1,5 +1,6 @@
-// sender.test.ts — StreamSession 状态机：首片/场景切换/节流/错误恢复/收尾/sendfile 标记剥离
-import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+// sender.test.ts — StreamSession 状态机：首片/场景切换/节流/错误恢复/收尾/sendfile 标记与思考标签剥离
+// 正文路径为官方 SDK 语义：replace + 全量文本（每帧携带当前累计全文，index 每帧递增）。
+import { afterEach, describe, expect, test } from "bun:test"
 import { StreamSession, type StreamSessionOptions } from "../src/qq/sender.js"
 import { renderCopy } from "../src/copy.js"
 import type { MessageContext } from "../src/qq/types.js"
@@ -49,15 +50,19 @@ function shards(calls: Recorded[]): ShardBody[] {
   return calls.filter((c) => c.body.content_raw !== undefined).map((c) => c.body as unknown as ShardBody)
 }
 
+/** 仅成功下发的分片（失败尝试不计入） */
+function okShards(calls: Recorded[]): ShardBody[] {
+  return calls.filter((c) => c.ok && c.body.content_raw !== undefined).map((c) => c.body as unknown as ShardBody)
+}
+
 /** 仅统计成功下发的分片内容（失败尝试不计入） */
 function sentText(calls: Recorded[]): string {
-  return calls
-    .filter((c) => c.ok && c.body.content_raw !== undefined)
-    .map((c) => c.body.content_raw as string)
+  return okShards(calls)
+    .map((s) => s.content_raw)
     .join("")
 }
 
-/** 自动推进假时钟：每次 now() 调用前进 step ⇒ throttle 计算出的等待恒 ≤ 0，零真实 sleep */
+/** 自动推进假时钟：每次 now() 调用前进 step ⇒ throttle/退避计算出的等待恒 ≤ 0，零真实 sleep */
 function autoClock(step: number): () => number {
   let t = 1_000_000
   return () => (t += step)
@@ -93,6 +98,8 @@ function expectMsgSeqConstantPerStream(list: ShardBody[]): void {
 const A40 = "A".repeat(40)
 const B40 = "B".repeat(40)
 const C40 = "C".repeat(40)
+const A30 = "A".repeat(30)
+const B30 = "B".repeat(30)
 
 // 会话登记：afterEach 兜底 abort，避免 dots timer 泄漏到其他用例
 const live: StreamSession[] = []
@@ -127,7 +134,7 @@ describe("StreamSession.start", () => {
     expect(list[0].index).toBe(0)
     expect(list[0].input_mode).toBe("replace")
     expect(list[0].input_state).toBe(1)
-    expect(list[0].content_type).toBe("text")
+    expect(list[0].content_type).toBe("markdown")
     expect(list[0].msg_id).toBe("MID1")
     expect(list[0].stream_msg_id).toBeUndefined()
     expect(typeof list[0].msg_seq).toBe("number")
@@ -185,7 +192,7 @@ describe("StreamSession.switchScene", () => {
     expect(s.state).toBe("streaming")
   })
 
-  test("正文流进行中 switchScene(TEXT) 重置正文流：终片 + deliveredBody 清零 + 下段 index0", async () => {
+  test("正文流进行中 switchScene(TEXT) 重置正文流：全量终片 + deliveredBody 清零 + 下段 index0", async () => {
     const { calls, fetchImpl } = makeRecorder()
     const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
     await s.start()
@@ -193,7 +200,13 @@ describe("StreamSession.switchScene", () => {
     await s.switchScene("TEXT", { snippet: "x" })
     expect(s.deliveredBody).toBe("")
     let list = shards(calls)
-    expect(list[3]).toMatchObject({ input_mode: "append", input_state: 10, stream_msg_id: "id-3" })
+    // 段落终片 = replace + 该段全量 + state10
+    expect(list[3]).toMatchObject({
+      content_raw: A40,
+      input_mode: "replace",
+      input_state: 10,
+      stream_msg_id: "id-3",
+    })
     // 下一段正文另起新流
     await s.pushBody(B40)
     list = shards(calls)
@@ -223,10 +236,10 @@ describe("StreamSession.switchScene", () => {
     expect(proactive[0].url).toBe("https://api.sgroup.qq.com/v2/users/U1/messages")
     // 正文流未关闭：仍只有 WAITING open/close + body open 三片
     expect(shards(calls)).toHaveLength(3)
-    // 后续正文继续 append 到原正文流
+    // 后续正文以 replace+全量续帧（携带累计全文）
     await s.pushBody(B40)
     const list = shards(calls)
-    expect(list[3]).toMatchObject({ content_raw: B40, input_mode: "append", index: 1, stream_msg_id: "id-3" })
+    expect(list[3]).toMatchObject({ content_raw: A40 + B40, input_mode: "replace", index: 1, stream_msg_id: "id-3" })
   })
 })
 
@@ -273,12 +286,12 @@ describe("StreamSession.pushBody 节流", () => {
 // ---- 错误恢复 -------------------------------------------------------------
 
 describe("StreamSession 错误恢复", () => {
-  test("40007 前缀冲突 → 另起新流（首片 replace 全文，后续走新流）", async () => {
+  test("40007 前缀冲突 → 安全终片结束流 + state=failed（不再另起新流续传）", async () => {
     let failedOnce = false
     const { calls, fetchImpl } = makeRecorder((body) => {
       if (
         !failedOnce &&
-        body.input_mode === "append" &&
+        body.input_mode === "replace" &&
         body.input_state === 1 &&
         body.index >= 1 &&
         body.stream_msg_id
@@ -291,89 +304,87 @@ describe("StreamSession 错误恢复", () => {
     const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
     await s.start()
     await s.pushBody(A40)
-    await s.pushBody(B40) // append 撞 40007 → 另起新流
-    let list = shards(calls)
-    // 新流首片 = 已下发 + 缓冲 全文（replace/index0/msg_id）
-    expect(list[4]).toMatchObject({
-      content_raw: A40 + B40,
-      index: 0,
-      input_mode: "replace",
-      input_state: 1,
-      msg_id: "MID1",
-    })
-    expect(s.state).toBe("streaming")
-    // 后续 append 走新流
+    await s.pushBody(B40) // 全量帧撞 40007 → 结束流 + failed
+    const list = shards(calls)
+    // 冲突终片：append+空+state10（不改写已下发内容）
+    expect(list[list.length - 1]).toMatchObject({ input_mode: "append", input_state: 10 })
+    // 不再另起新流续传：全部分片中带 msg_id 的新流首片只有 WAITING 与正文 open 两个
+    expect(list.filter((x) => x.msg_id !== undefined)).toHaveLength(2)
+    expect(s.state).toBe("failed")
+    expect(s.deliveredBody).toBe(A40) // lastAcceptedFull 停在最后一次成功下发
+    // failed 后 finish false（bridge 走全量兜底），后续 pushBody 零请求
+    const ok = await s.finish(A40 + B40)
+    expect(ok).toBe(false)
+    const callsBefore = calls.length
     await s.pushBody(C40)
-    list = shards(calls)
-    expect(list[5]).toMatchObject({ content_raw: C40, input_mode: "append", index: 1, stream_msg_id: "id-5" })
-    expectMsgSeqConstantPerStream(list)
+    expect(calls.length).toBe(callsBefore)
   })
 
-  test("[PRODUCT_BUG] 40007 恢复后 deliveredBody 应等于已下发全文（当前被重复累计）", async () => {
-    let failedOnce = false
-    const { calls, fetchImpl } = makeRecorder((body) => {
-      if (
-        !failedOnce &&
-        body.input_mode === "append" &&
-        body.input_state === 1 &&
-        body.index >= 1 &&
-        body.stream_msg_id
-      ) {
-        failedOnce = true
-        return new Response(JSON.stringify({ code: 40007, message: "prefix conflict" }), { status: 400 })
-      }
-      return undefined
-    })
+  test("[PRODUCT_BUG1] deliveredBody 恒等于最后成功帧的全量文本（无重复累计）", async () => {
+    const { calls, fetchImpl } = makeRecorder()
     const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
-    await s.start()
-    await s.pushBody(A40)
-    await s.pushBody(B40) // 40007 → 新流首片已含 A40+B40
-    // 契约：deliveredBody = 已成功下发正文 = A40+B40。
-    // 当前实现：sendAppendWithRetry 的 40007 分支已把 chunk 并入 bodyDelivered，
-    // flushBody 循环体又执行 bodyDelivered += chunk → A40+B40+B40（sender.ts:539-541 与 :658 重复累计）。
-    expect(s.deliveredBody).toBe(A40 + B40)
-  })
-
-  test("50002 频控 → 退避后重试成功", async () => {
-    let appendAttempts = 0
-    const { calls, fetchImpl } = makeRecorder((body) => {
-      if (body.input_mode === "append" && body.input_state === 1 && body.index >= 1 && body.stream_msg_id) {
-        appendAttempts += 1
-        if (appendAttempts === 1) {
-          return new Response(JSON.stringify({ code: 50002, message: "rate limited" }), { status: 429 })
-        }
-      }
-      return undefined
-    })
-    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(100), { intervalMs: 100 })))
     await s.start()
     await s.pushBody(A40)
     await s.pushBody(B40)
-    expect(appendAttempts).toBe(2) // 第一次 50002 → 退避 2×intervalMs → 第二次成功
-    const list = shards(calls)
-    expect(list[list.length - 1]).toMatchObject({ content_raw: B40, input_mode: "append" })
-    expect(s.state).toBe("streaming")
-    expect(s.deliveredBody).toBe(A40 + B40)
+    await s.pushBody(C40)
+    const okList = okShards(calls)
+    // replace 语义：每个正文帧都携带当前累计全文
+    expect(okList[2].content_raw).toBe(A40)
+    expect(okList[3].content_raw).toBe(A40 + B40)
+    expect(okList[4].content_raw).toBe(A40 + B40 + C40)
+    // 契约（Bug 1 意图，replace 形态）：deliveredBody = 最后一次成功下发的全量文本，
+    // 不存在 append 时代「恢复路径重复累计」的状态（旧实现 40007 恢复后 A40+B40+B40）。
+    expect(s.deliveredBody).toBe(A40 + B40 + C40)
+    expect(s.deliveredBody).toBe(okList[okList.length - 1].content_raw)
+    expect(await s.finish(A40 + B40 + C40)).toBe(true)
   })
 
-  test("[PRODUCT_BUG] 50002 持续频控应保留缓冲、解除后补发（当前实现静默丢内容）", async () => {
-    let rateLimited = true
+  test("50002 频控 → 指数退避重试成功，且重试时 index 前进", async () => {
+    let failedOnce = false
     const { calls, fetchImpl } = makeRecorder((body) => {
-      if (rateLimited && body.input_mode === "append" && body.input_state === 1) {
+      if (!failedOnce && body.input_mode === "replace" && body.input_state === 1 && body.index >= 1 && body.stream_msg_id) {
+        failedOnce = true
         return new Response(JSON.stringify({ code: 50002, message: "rate limited" }), { status: 429 })
       }
       return undefined
     })
-    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(100), { intervalMs: 100 })))
+    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(10_000))))
     await s.start()
     await s.pushBody(A40)
-    await s.pushBody(B40) // 两次 50002 → sendAppendWithRetry 静默 return
-    rateLimited = false // 频控解除
-    await s.finish(A40 + B40)
-    // 契约（回退矩阵）：频控期间缓冲保留，解除后正文延迟继续 → B40 应最终补发。
-    // 当前实现：B40 从未下发却被计入 bodyDelivered（sender.ts sendAppendWithRetry 的
-    // “仍频控：缓冲保留”注释与 flushBody 的 bodyDelivered += chunk 行为矛盾）。
-    expect(sentText(calls)).toContain(B40)
+    await s.pushBody(B40) // 首次 50002 → 退避 → 重试成功
+    const contFrames = shards(calls).filter((x) => x.input_mode === "replace" && x.index >= 1 && x.stream_msg_id)
+    // 官方语义：重试时 index 前进（首试 index1，重试 index2）
+    expect(contFrames.map((x) => x.index)).toEqual([1, 2])
+    expect(contFrames[1].content_raw).toBe(A40 + B40)
+    expect(contFrames[1].input_mode).toBe("replace")
+    expect(s.state).toBe("streaming")
+    expect(s.deliveredBody).toBe(A40 + B40)
+    expectMsgSeqConstantPerStream(shards(calls))
+  })
+
+  test("[PRODUCT_BUG2] 50002 三次重试全失败 → lastAcceptedFull 不推进、finish false → 回退全量", async () => {
+    const { calls, fetchImpl } = makeRecorder((body) => {
+      // 正文续帧（含终片）持续频控；首片（index0/msg_id）与占位流不受影响
+      if (body.input_mode === "replace" && body.index >= 1 && body.stream_msg_id) {
+        return new Response(JSON.stringify({ code: 50002, message: "rate limited" }), { status: 429 })
+      }
+      return undefined
+    })
+    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(10_000))))
+    await s.start()
+    await s.pushBody(A40) // 开流成功
+    await s.pushBody(B40) // 1+3 次尝试全 50002 → 跳帧
+    await s.pushBody(C40) // 再 1+3 次尝试全 50002 → 跳帧
+    const contFrames = shards(calls).filter((x) => x.input_mode === "replace" && x.index >= 1 && x.stream_msg_id)
+    // 每轮 = 首试 + 3 次重试（index 前进），两轮共 8 次
+    expect(contFrames.map((x) => x.index)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
+    // 契约（Bug 2 意图，replace 形态）：频控耗尽后 lastAcceptedFull 不推进——
+    // 旧实现静默 return 却把 chunk 计入 bodyDelivered → finish 误报 true → 用户永久丢正文。
+    expect(s.deliveredBody).toBe(A40)
+    expect(sentText(calls)).not.toContain(B40)
+    const ok = await s.finish(A40 + B40 + C40) // 终片同样频控耗尽 → failed
+    expect(ok).toBe(false)
+    expect(s.state).toBe("failed")
   })
 
   test("start 首片失败 → state=failed，后续方法零请求", async () => {
@@ -405,7 +416,7 @@ describe("StreamSession 错误恢复", () => {
 // ---- 收尾 -----------------------------------------------------------------
 
 describe("StreamSession.finish / abort", () => {
-  test("deliveredBody 与 finalText 一致 → true，终片 state10", async () => {
+  test("deliveredBody 与 finalText 一致 → true，终片 replace+全量+state10", async () => {
     const { calls, fetchImpl } = makeRecorder()
     const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
     await s.start()
@@ -413,8 +424,8 @@ describe("StreamSession.finish / abort", () => {
     const ok = await s.finish(A40)
     expect(ok).toBe(true)
     expect(s.state).toBe("finished")
-    const list = shards(calls)
-    expect(list[list.length - 1].input_state).toBe(10)
+    const list = okShards(calls)
+    expect(list[list.length - 1]).toMatchObject({ content_raw: A40, input_mode: "replace", input_state: 10 })
     expectMsgSeqConstantPerStream(list)
   })
 
@@ -438,7 +449,7 @@ describe("StreamSession.finish / abort", () => {
   })
 })
 
-// ---- sendfile 标记剥离（第二轮 HANDOFF 五切面） ---------------------------
+// ---- sendfile 标记剥离 ----------------------------------------------------
 
 describe("StreamSession sendfile 标记剥离", () => {
   test("完整标记直接剥离：分片与 deliveredBody 均无标记文本", async () => {
@@ -454,21 +465,21 @@ describe("StreamSession sendfile 标记剥离", () => {
     expect(s.deliveredBody).toBe("前".repeat(20) + "后".repeat(20))
   })
 
-  test("标记跨 delta 拆分：中途 flush 后残片扣留，补全后剥离", async () => {
+  test("标记跨 delta 拆分：中途 flush 后残片扣留，补全后整块剥离", async () => {
     const { calls, fetchImpl } = makeRecorder()
     const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
     await s.start()
-    await s.pushBody("A".repeat(30) + "[[sendfile:/tmp/a") // 30 字符触发真实中途 flush
-    const afterFirst = shards(calls)
-    expect(afterFirst[afterFirst.length - 1].content_raw).toBe("A".repeat(30)) // 正文首片不含残片
+    await s.pushBody(A30 + "[[sendfile:/tmp/a") // 30 字符触发真实中途 flush
+    const afterFirst = okShards(calls)
+    expect(afterFirst[afterFirst.length - 1].content_raw).toBe(A30) // 正文首片不含残片
     expect(sentText(calls)).not.toContain("sendfile")
     expect(sentText(calls)).not.toContain("/tmp/a")
-    await s.pushBody(".txt]]" + "B".repeat(30))
-    const ok = await s.finish("A".repeat(30) + "B".repeat(30))
+    await s.pushBody(".txt]]" + B30)
+    const ok = await s.finish(A30 + B30)
     expect(ok).toBe(true)
     expect(sentText(calls)).not.toContain("sendfile")
     expect(sentText(calls)).not.toContain("/tmp/a")
-    expect(s.deliveredBody).toBe("A".repeat(30) + "B".repeat(30))
+    expect(s.deliveredBody).toBe(A30 + B30)
   })
 
   test("终刷丢弃未闭合的残片（不进终片）", async () => {
@@ -502,5 +513,116 @@ describe("StreamSession sendfile 标记剥离", () => {
     await s.pushBody("D".repeat(40))
     const ok = await s.finish("D".repeat(40) + "[[sendfile:/tmp/x.pdf]]")
     expect(ok).toBe(false) // deliveredBody（已剥离）≠ 原始文本 → 必须回退全量回复
+  })
+})
+
+// ---- 思考标签剥离（官方 sanitize.ts 同款） ----------------------------------
+
+describe("StreamSession 思考标签剥离", () => {
+  test("成对思考标签块整块剥离：分片与 deliveredBody 均无标签内容", async () => {
+    const { calls, fetchImpl } = makeRecorder()
+    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
+    await s.start()
+    await s.pushBody("<thinking>秘密推理</thinking>" + A30)
+    const ok = await s.finish(A30)
+    expect(ok).toBe(true)
+    expect(sentText(calls)).not.toContain("thinking")
+    expect(sentText(calls)).not.toContain("秘密推理")
+    expect(s.deliveredBody).toBe(A30)
+  })
+
+  test("system-reminder / previous_response / deepseek 反引号风格同样剥离", async () => {
+    const { calls, fetchImpl } = makeRecorder()
+    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
+    await s.start()
+    await s.pushBody(
+      "<system-reminder>sys</system-reminder><previous_response>prev</previous_response>`think`deep`/think`" + B30,
+    )
+    const ok = await s.finish(B30)
+    expect(ok).toBe(true)
+    expect(sentText(calls)).not.toContain("system-reminder")
+    expect(sentText(calls)).not.toContain("previous_response")
+    expect(sentText(calls)).not.toContain("deep")
+    expect(s.deliveredBody).toBe(B30)
+  })
+
+  test("未闭合 thinking 残标签吞到文末：不闪现，finish 基准一致", async () => {
+    const { calls, fetchImpl } = makeRecorder()
+    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
+    await s.start()
+    await s.pushBody(A30 + "<thinking>未闭合的思考")
+    const ok = await s.finish(A30)
+    expect(ok).toBe(true)
+    expect(sentText(calls)).not.toContain("未闭合")
+    expect(s.deliveredBody).toBe(A30)
+  })
+
+  test("标签跨 delta 拆分：尾部残片扣留，补全后整块剥离", async () => {
+    const { calls, fetchImpl } = makeRecorder()
+    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
+    await s.start()
+    await s.pushBody(A30 + "<thin") // 残片扣留，正文首片不含
+    const afterFirst = okShards(calls)
+    expect(afterFirst[afterFirst.length - 1].content_raw).toBe(A30)
+    await s.pushBody("king>秘密</thinking>" + B30)
+    const ok = await s.finish(A30 + B30)
+    expect(ok).toBe(true)
+    expect(sentText(calls)).not.toContain("秘密")
+    expect(s.deliveredBody).toBe(A30 + B30)
+  })
+
+  test("孤立闭标签剥离且不破坏前缀延伸", async () => {
+    const { calls, fetchImpl } = makeRecorder()
+    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
+    await s.start()
+    await s.pushBody(A30 + "</thinking>" + B30)
+    const ok = await s.finish(A30 + B30)
+    expect(ok).toBe(true)
+    expect(sentText(calls)).not.toContain("thinking")
+    expect(s.deliveredBody).toBe(A30 + B30)
+  })
+
+  test("终刷放行思考标签残片（与 sendfile 残片丢弃相反）：正文以反引号结尾不误回退", async () => {
+    const { calls, fetchImpl } = makeRecorder()
+    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
+    await s.start()
+    await s.pushBody(A30 + "`") // 流式中扣留（疑似 `think` 前缀）
+    const afterFirst = okShards(calls)
+    expect(afterFirst[afterFirst.length - 1].content_raw).toBe(A30)
+    const ok = await s.finish(A30 + "`") // 终刷放行：与官方完整文本 sanitize 口径一致
+    expect(ok).toBe(true)
+    const list = okShards(calls)
+    expect(list[list.length - 1].content_raw).toBe(A30 + "`")
+  })
+})
+
+// ---- content_type 跟随 MARKDOWN -------------------------------------------
+
+describe("StreamSession content_type 跟随 MARKDOWN", () => {
+  test("MARKDOWN=on（默认）→ 全部流式分片 content_type=markdown", async () => {
+    const { calls, fetchImpl } = makeRecorder()
+    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
+    await s.start()
+    await s.pushBody(A40)
+    await s.finish(A40)
+    expect(shards(calls).length).toBeGreaterThanOrEqual(4)
+    expect(shards(calls).every((x) => x.content_type === "markdown")).toBe(true)
+  })
+
+  test("MARKDOWN=off → 全部分片 content_type=text（模块级 env 读取，query 串独立实例）", async () => {
+    process.env.MARKDOWN = "off"
+    try {
+      const spec: string = "../src/qq/sender.js?markdown=off"
+      const mod = (await import(spec)) as typeof import("../src/qq/sender.js")
+      const { calls, fetchImpl } = makeRecorder()
+      const s = track(new mod.StreamSession(baseOpts(fetchImpl, autoClock(1500))))
+      await s.start()
+      await s.pushBody(A40)
+      await s.finish(A40)
+      expect(shards(calls).length).toBeGreaterThanOrEqual(4)
+      expect(shards(calls).every((x) => x.content_type === "text")).toBe(true)
+    } finally {
+      delete process.env.MARKDOWN
+    }
   })
 })

@@ -1,5 +1,5 @@
 // @input:  ./api (sendC2CMessage, sendGroupMessage, sendStreamMessage, classifyStreamError), ./types (MessageContext), ../copy (Scene, CopyVars)
-// @output: replyToQQ, formatForQQ, splitMessage, sendProactiveToQQ, StreamSession
+// @output: replyToQQ, formatForQQ, splitMessage, sendProactiveToQQ, stripThinkingTags, StreamSession
 // @pos:    qq层 - 消息发送 (Markdown格式化 + 分割 + 被动回复 + 流式会话状态机)
 import {
   sendC2CMessage,
@@ -23,6 +23,9 @@ const DEFAULT_MAX_LENGTH = 3000
 
 // QQ 原生 markdown（msg_type=2）；关闭则回退纯文本
 const MARKDOWN_ENABLED = (process.env.MARKDOWN ?? "on").toLowerCase() !== "off"
+
+// 流式分片 content_type 跟随 MARKDOWN 开关（上游普通路径 on→原生 markdown，流式同款；模块级 env 读取，不新增 env 键）
+const STREAM_CONTENT_TYPE: "markdown" | "text" = MARKDOWN_ENABLED ? "markdown" : "text"
 
 // Markdown -> QQ 纯文本: 保留代码块，去除其他标记
 export function formatForQQ(text: string): string {
@@ -196,8 +199,12 @@ export async function sendFileToQQ(
 // 流式会话（实验性，仅 C2C）
 // ---------------------------------------------------------------------------
 
-/** 正文缓冲达到该长度才允许 flush（内部常量，不设 env） */
+/** 正文累计达到该长度才允许 flush（内部常量，不设 env） */
 const MIN_FLUSH_CHARS = 24
+
+/** 频控重试上限与指数退避基数（官方 streaming.ts：50002/HTTP 429 最多 3 次重试，1000/2000/4000ms） */
+const RATE_LIMIT_RETRIES = 3
+const RATE_LIMIT_BACKOFF_BASE_MS = 1000
 
 /** 等待动画帧序列：前缀单调递增，满足 40007「已下发前缀不可修改」约束 */
 const DOTS_FRAMES = ["", ".", "..", "..."] as const
@@ -248,12 +255,58 @@ function isSendFilePrefix(s: string): boolean {
   return !closable || pathChars > 0
 }
 
+// ---- 思考标签剥离（官方 sanitize.ts 同款） -----------------------------------
+
+/** 成对思考标签块：<system-reminder>/<previous_response>/<thinking> 与 deepseek 反引号风格 `think`...`/think` */
+const THINK_BLOCK_RE =
+  /<system-reminder>[\s\S]*?<\/system-reminder>|<previous_response>[\s\S]*?<\/previous_response>|<thinking>[\s\S]*?<\/thinking>|`think`[\s\S]*?`\/think`/g
+/** 残标签：未闭合的开标签（吞到文末）与孤立的闭标签 */
+const THINK_RESIDUAL_RE = /<system-reminder>[\s\S]*$|<previous_response>[\s\S]*$|<thinking>[\s\S]*$|`think`[\s\S]*$/g
+const THINK_ORPHAN_CLOSE_RE = /<\/(?:system-reminder|previous_response|thinking)>|`\/think`/g
+
+/**
+ * 剥离模型思考标签（成对块 + 残标签）。
+ * 单一剥离函数两处共用：StreamSession 流式正文（本文件）与 finish 比对基准（bridge.ts），
+ * 保证两侧对同一段文本产出一致，finish 比对不因剥离口径漂移而误判。
+ */
+export function stripThinkingTags(text: string): string {
+  return text
+    .replace(THINK_BLOCK_RE, "")
+    .replace(THINK_RESIDUAL_RE, "")
+    .replace(THINK_ORPHAN_CLOSE_RE, "")
+}
+
+/** 思考标签开/闭串全集（含反引号风格）；流式尾部疑似未闭合片段按其前缀语言扣留 */
+const THINK_TAG_STRINGS = [
+  "<system-reminder>",
+  "</system-reminder>",
+  "<previous_response>",
+  "</previous_response>",
+  "<thinking>",
+  "</thinking>",
+  "`think`",
+  "`/think`",
+] as const
+
+/**
+ * text 尾部若是「疑似未闭合的思考标签前缀」片段（如 <thi、`/thi），返回该片段；否则返回 ""。
+ * 与 trailingSendFileFragment 同款语义：扣留给后续 delta 补全，避免半截标签闪现。
+ */
+function trailingThinkingFragment(text: string): string {
+  const maxLen = Math.min(text.length, THINK_TAG_STRINGS.reduce((m, s) => Math.max(m, s.length), 0))
+  for (let len = maxLen; len >= 1; len--) {
+    const tail = text.slice(text.length - len)
+    if (THINK_TAG_STRINGS.some((tag) => tail.length < tag.length && tag.startsWith(tail))) return tail
+  }
+  return ""
+}
+
 export interface StreamSessionOptions {
   token: () => Promise<string> // 惰性取 token（复用 getAccessToken 缓存），勿存字符串
   ctx: MessageContext // 仅 C2C；构造时校验，群聊抛错（双保险，bridge 侧已按 ctx.type 过滤）
   render: (scene: Scene, vars: CopyVars) => string // bridge 传入绑定 config.texts 的 renderCopy
   intervalMs: number // 任意两次 HTTP 发送的最小间隔
-  chunkSize: number // 正文单片最大字符数
+  chunkSize: number // 兼容保留（append 时代的正文单片上限；replace 全量模式下不再切分，配置键不动）
   maxScenes: number // 占位流条数上限（含首条 WAITING；占位流+正文流共享被动回复 4 次预算）
   fetchImpl?: typeof fetch // 测试注入，缺省 globalThis.fetch
   now?: () => number // 测试注入假时钟，缺省 Date.now
@@ -264,9 +317,11 @@ export type StreamSessionState = "idle" | "streaming" | "finished" | "aborted" |
 /**
  * 一条 QQ 消息的流式输出会话。
  *
- * 核心语义（由 40007 前缀约束推出）：replace 新内容必须以已下发前缀开头，
- * 场景文案无法原地改写 ⇒ switchScene = 旧流终片(state10) + 另起新流（新 QQ 消息）首片；
- * dots 动画因帧序列前缀单调可用 replace；pushBody 用 append 增量。
+ * 核心语义（对齐官方 SDK @tencent-connect/qqbot-nodejs 的 streaming.ts）：
+ * 正文每帧发送「当前累计全文」（input_mode=replace，index 每帧递增），不做 append 增量——
+ * deliveredBody 的唯一真理源 = 最后一次成功下发的全量文本（lastAcceptedFull），不存在「部分消费」状态。
+ * 40007 前缀约束 ⇒ 场景文案无法原地改写 ⇒ switchScene = 旧流终片(state10) + 另起新流首片；
+ * dots 动画因帧序列前缀单调可用 replace。
  * 所有发送经 sendChain 串行并按 intervalMs 节流；任何方法失败不抛给 bridge（内部 catch + 置 state）。
  */
 export class StreamSession {
@@ -280,9 +335,8 @@ export class StreamSession {
   private msgSeq = 0 // 每条新流首片取一次 getNextMsgSeq 并在同流内复用（官方示例同流 msg_seq 恒定）
   private sceneStreamsOpened = 0 // 已开启的占位流条数（含首条 WAITING）
   private bodyStreamActive = false
-  private bodyDelivered = "" // 已成功下发的正文（原始字符，不含 BODY 模板前缀）
-  private bodyBuffer = "" // 待 flush 的正文增量（已剥离 sendfile 标记）
-  private markerHold = "" // 扣留的疑似未闭合 [[sendfile: 片段（等后续 delta 补全；终刷时丢弃）
+  private rawBody = "" // 当前段正文全量累计（未剥离；剥离在 flush 时对全量重算，无「部分消费」状态）
+  private lastAcceptedFull = "" // 最后一次成功下发的全量正文（剥离后基准；deliveredBody 的唯一真理源）
   private activeScene: Scene | null = null
   private dotsFrame = 0
   private dotsTimer: ReturnType<typeof setInterval> | null = null
@@ -303,9 +357,9 @@ export class StreamSession {
     return this._state
   }
 
-  /** 已成功下发的正文（原始字符） */
+  /** 已成功下发的正文（= 最后一次成功下发的全量文本，剥离标记/思考标签后） */
   get deliveredBody(): string {
-    return this.bodyDelivered
+    return this.lastAcceptedFull
   }
 
   /** WAITING 首片：index0/replace/state1/msg_id 被动锚定；失败置 state=failed */
@@ -343,13 +397,12 @@ export class StreamSession {
 
       if (this.bodyStreamActive) {
         if (scene === "TEXT") {
-          // 上一段正文已流式展示：冲刷尾巴并以终片关闭，下一段 pushBody 另起新正文流
+          // 上一段正文已流式展示：以终片（全量+state10）关闭，下一段 pushBody 另起新正文流
           await this.flushBody(true)
           if (this._state !== "streaming") return
           this.bodyStreamActive = false
-          this.bodyDelivered = ""
-          this.bodyBuffer = ""
-          this.markerHold = "" // 段落已关闭：残片不属于下一段正文（flushBody 终刷后竞态兜底）
+          this.lastAcceptedFull = ""
+          this.rawBody = ""
           this.streamMsgId = null // 正文流已以终片关闭，避免对已关闭的流再发终片
           this.nextIndex = 0
           return
@@ -372,7 +425,7 @@ export class StreamSession {
         }
       }
       try {
-        await this.openStreamWithRetry(content)
+        await this.openStream(content)
         this.sceneStreamsOpened++
         this.activeScene = scene
       } catch (err) {
@@ -384,20 +437,16 @@ export class StreamSession {
   }
 
   /**
-   * 正文增量：缓冲 + 节流 append 分片（达到 minFlush 才发，单片不超过 chunkSize）。
-   * [[sendfile:...]] 标记在进入下发缓冲前剥离：完整的直接删掉；尾部疑似未闭合的
-   * 片段扣留在 markerHold 等后续 delta 补全，避免半截标记闪现（文件由 bridge 的
+   * 正文增量：累计进全量缓冲，节流后以 replace+全量分片下发（达到 minFlush 才发）。
+   * [[sendfile:...]] 标记与思考标签在 flush 时对全量文本统一剥离：完整标记/标签块直接删掉；
+   * 尾部疑似未闭合的片段扣留给后续 delta 补全，避免半截标记/标签闪现（文件由 bridge 的
    * deliverResult 单独发送，不走流式正文）。
    */
   async pushBody(delta: string): Promise<void> {
     if (this._state !== "streaming") return
     if (!delta) return
     this.stopDotsTimer()
-    const merged = this.markerHold + delta
-    const stripped = merged.replace(SEND_FILE_MARKER_RE, "")
-    const hold = trailingSendFileFragment(stripped)
-    this.markerHold = hold
-    this.bodyBuffer += hold ? stripped.slice(0, stripped.length - hold.length) : stripped
+    this.rawBody += delta
     await this.enqueue(() => this.flushBody(false))
   }
 
@@ -419,7 +468,7 @@ export class StreamSession {
       if (this.bodyStreamActive) {
         await this.flushBody(true)
         this.finishResult =
-          this._state === "streaming" && this.bodyDelivered.trim() === finalText.trim()
+          this._state === "streaming" && this.lastAcceptedFull.trim() === finalText.trim()
       } else {
         // 正文流从未开启：关闭占位流；仅当最终文本为空才算已投递
         if (this.streamMsgId) {
@@ -470,8 +519,14 @@ export class StreamSession {
     this.lastSendAt = this.now()
   }
 
-  private async backoff(): Promise<void> {
-    await new Promise((r) => setTimeout(r, 2 * this.opts.intervalMs))
+  /**
+   * 频控指数退避（官方基数 1000ms：1000/2000/4000）。
+   * 从上一次发送起算补足等待时长（注入时钟步进 ≥ 4000 可在测试中归零真实等待）。
+   */
+  private async backoff(retry: number): Promise<void> {
+    const delay = RATE_LIMIT_BACKOFF_BASE_MS * 2 ** (retry - 1)
+    const wait = delay - (this.now() - this.lastSendAt)
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait))
   }
 
   private async sendShard(shard: StreamShard): Promise<StreamShardResponse> {
@@ -483,34 +538,39 @@ export class StreamSession {
     return sendStreamMessage(token, this.opts.ctx.userId, shard, this.fetchImpl)
   }
 
-  /** 另起新流：首片 replace/state1/index0，带 msg_id 被动锚定；msg_seq 本流内复用 */
+  /**
+   * 另起新流：首片 replace/state1/index0，带 msg_id 被动锚定；msg_seq 本流内复用。
+   * 频控（50002/HTTP 429）按官方策略重试：最多 3 次、指数退避。首片重试保持 index0
+   * （msg_id+msg_seq 去重锚定；index>0 需要 stream_msg_id，而失败响应不携带）。
+   */
   private async openStream(content: string): Promise<void> {
     this.msgSeq = getNextMsgSeq(this.opts.ctx.msgId)
     this.nextIndex = 0
-    const res = await this.sendShard({
-      content,
-      index: 0,
-      inputMode: "replace",
-      inputState: 1,
-      contentType: "text",
-      msgId: this.opts.ctx.msgId,
-      msgSeq: this.msgSeq,
-    })
-    this.streamMsgId = res.id
-    this.nextIndex = 1
-  }
-
-  /** 新流首片：频控先退避 2×intervalMs，重试 1 次；再败向上抛 */
-  private async openStreamWithRetry(content: string): Promise<void> {
-    try {
-      await this.openStream(content)
-    } catch (err) {
-      if (classifyStreamError(err) === "rate-limited") await this.backoff()
-      await this.openStream(content)
+    for (let retry = 0; ; retry++) {
+      try {
+        const res = await this.sendShard({
+          content,
+          index: 0,
+          inputMode: "replace",
+          inputState: 1,
+          contentType: STREAM_CONTENT_TYPE,
+          msgId: this.opts.ctx.msgId,
+          msgSeq: this.msgSeq,
+        })
+        this.streamMsgId = res.id
+        this.nextIndex = 1
+        return
+      } catch (err) {
+        if (classifyStreamError(err) === "rate-limited" && retry < RATE_LIMIT_RETRIES) {
+          await this.backoff(retry + 1)
+          continue
+        }
+        throw err
+      }
     }
   }
 
-  /** 旧流终片：state10 空内容标记结束 */
+  /** 旧流终片：state10 空内容标记结束（append+空串不改写已下发内容） */
   private async closeStream(): Promise<void> {
     if (!this.streamMsgId) return
     await this.sendShard({
@@ -518,7 +578,7 @@ export class StreamSession {
       index: this.nextIndex,
       inputMode: "append",
       inputState: 10,
-      contentType: "text",
+      contentType: STREAM_CONTENT_TYPE,
       streamMsgId: this.streamMsgId,
       msgSeq: this.msgSeq,
     })
@@ -526,64 +586,62 @@ export class StreamSession {
     this.nextIndex = 0
   }
 
-  /** 正文 append 分片；40007 另起流（首片=已下发+缓冲全文），50002 退避重试 */
-  private async sendAppendWithRetry(chunk: string, state: 1 | 10): Promise<void> {
-    try {
-      await this.sendAppend(chunk, state)
-      return
-    } catch (err) {
-      const kind = classifyStreamError(err)
-      if (kind === "prefix-conflict") {
-        // 另起流：新流首片 = 已下发 + 当前缓冲 全文（replace）
-        const fullRaw = this.bodyDelivered + this.bodyBuffer
-        await this.openStreamWithRetry(this.renderBody(fullRaw))
-        this.bodyDelivered = fullRaw
-        this.bodyBuffer = ""
-        if (state === 10) await this.sendAppend("", 10) // 补终片
-        return
-      }
-      if (kind === "rate-limited") {
-        await this.backoff()
-        try {
-          await this.sendAppend(chunk, state)
-          return
-        } catch (err2) {
-          if (classifyStreamError(err2) === "rate-limited") return // 仍频控：缓冲保留，会话保持
-          throw err2
-        }
-      }
-      throw err
-    }
-  }
-
-  private async sendAppend(chunk: string, state: 1 | 10): Promise<void> {
-    if (!this.streamMsgId) throw new Error("[stream] append 无活动流")
-    const res = await this.sendShard({
-      content: chunk,
-      index: this.nextIndex,
-      inputMode: "append",
-      inputState: state,
-      contentType: "text",
-      streamMsgId: this.streamMsgId,
-      msgSeq: this.msgSeq,
-    })
-    // 续片携带最近一次分片响应 id（若服务端整流恒定 id，则等价于首片 id）
-    this.streamMsgId = res.id
-    this.nextIndex++
-  }
-
-  /** 终片：剩余缓冲作为内容（可能为空串）；任意失败重试 1 次 */
-  private async sendFinalShard(): Promise<void> {
-    for (let attempt = 0; attempt < 2; attempt++) {
+  /**
+   * 正文分片：replace + 当前累计全文（官方语义：update() 携带全文而非增量）。
+   * 频控重试对齐官方：最多 3 次、指数退避，且重试时 index 前进
+   * （官方注释：Advance index for the retry to avoid stale index conflict）。
+   * 重试全部失败向上抛，由 flushBody 决定跳帧或终局。
+   */
+  private async sendBodyFrame(sendable: string, state: 1 | 10): Promise<void> {
+    if (!this.streamMsgId) throw new Error("[stream] 正文分片无活动流")
+    for (let retry = 0; ; retry++) {
+      const index = this.nextIndex
       try {
-        await this.sendAppendWithRetry(this.bodyBuffer, 10)
-        this.bodyDelivered += this.bodyBuffer
-        this.bodyBuffer = ""
+        const res = await this.sendShard({
+          content: this.renderBody(sendable),
+          index,
+          inputMode: "replace",
+          inputState: state,
+          contentType: STREAM_CONTENT_TYPE,
+          streamMsgId: this.streamMsgId,
+          msgSeq: this.msgSeq,
+        })
+        this.streamMsgId = res.id
+        this.nextIndex = index + 1
+        this.lastAcceptedFull = sendable
         return
       } catch (err) {
-        if (attempt === 1) throw err
+        const kind = classifyStreamError(err)
+        if (kind === "prefix-conflict") throw err // 由 flushBody 统一走冲突终局
+        if (kind === "rate-limited") {
+          // 官方注释：Advance index for the retry to avoid stale index conflict
+          // （含耗尽的最后一次失败也推进，下一帧绝不复用已尝试过的 index）
+          this.nextIndex = index + 1
+          if (retry < RATE_LIMIT_RETRIES) {
+            await this.backoff(retry + 1)
+            continue
+          }
+          throw err
+        }
+        throw err
       }
     }
+  }
+
+  /**
+   * 前缀冲突终局（官方 streaming-controller 的 prefixMatches 检查 + transition('failed') 同款）：
+   * 新全量文本不是已下发文本的前缀延伸（模型改写了已下发内容，或服务端 40007）——
+   * 以不改写内容的安全终片结束当前流并置 state=failed，交由 bridge 全量兜底（finish 返回 false）。
+   */
+  private async endStreamAsFailed(): Promise<void> {
+    if (this.streamMsgId) {
+      try {
+        await this.closeStream()
+      } catch (err) {
+        console.error("[stream] 冲突终片失败（忽略）:", err instanceof Error ? err.message : String(err))
+      }
+    }
+    this.markFailed()
   }
 
   private renderBody(text: string): string {
@@ -608,16 +666,26 @@ export class StreamSession {
 
   // ---- 内部：正文冲刷 ----------------------------------------------------
 
+  /**
+   * 冲刷正文：对全量累计重算「可下发文本」，按需发 replace+全量帧。
+   * 可下发文本 = 剥完整 sendfile 标记 → 剥思考标签（成对块+残标签）→ 扣留尾部疑似未闭合片段
+   * （sendfile 残片终刷时丢弃；思考标签残片终刷时放行——与官方完整文本 sanitize 口径一致，
+   * 避免正文以反引号/`<` 结尾时无谓回退）。
+   */
   private async flushBody(final: boolean): Promise<void> {
     if (this._state !== "streaming") return
-    // 终刷（finish / 段落切换）：输出已结束，扣留的未闭合标记残片无意义，直接丢弃，不进终片
-    if (final) this.markerHold = ""
-    if (!final && this.bodyBuffer.length < MIN_FLUSH_CHARS) return
+    const stripped = stripThinkingTags(this.rawBody.replace(SEND_FILE_MARKER_RE, ""))
+    let sendable = stripped
+    const markerTail = trailingSendFileFragment(stripped)
+    if (markerTail) sendable = sendable.slice(0, sendable.length - markerTail.length)
+    if (!final) {
+      const tagTail = trailingThinkingFragment(sendable)
+      if (tagTail) sendable = sendable.slice(0, sendable.length - tagTail.length)
+    }
 
     if (!this.bodyStreamActive) {
-      if (!this.bodyBuffer) return
-      // 开正文流：关闭占位流，首片 replace 全量（BODY 模板仅作用于首片）
-      const firstChunk = this.bodyBuffer.slice(0, this.opts.chunkSize)
+      // 开流门槛：仅非终刷且满 MIN_FLUSH_CHARS 才开正文流（终刷从不开流——未开流的收尾走占位流关闭+空比对）
+      if (final || !sendable || sendable.length < MIN_FLUSH_CHARS) return
       if (this.streamMsgId) {
         try {
           await this.closeStream()
@@ -626,46 +694,58 @@ export class StreamSession {
         }
       }
       try {
-        await this.openStreamWithRetry(this.renderBody(firstChunk))
+        await this.openStream(this.renderBody(sendable))
       } catch (err) {
+        if (classifyStreamError(err) === "rate-limited") {
+          // 开流频控重试耗尽：本轮跳过（占位流已关，下轮 flush 重新开流），会话保持
+          console.error("[stream] 正文流首片频控重试耗尽，本轮跳过（finish 比对失败将回退全量）")
+          return
+        }
         console.error("[stream] 正文流首片失败:", err instanceof Error ? err.message : String(err))
         this.markFailed()
         return
       }
       this.bodyStreamActive = true
       this.activeScene = "BODY"
-      this.bodyDelivered = firstChunk
-      this.bodyBuffer = this.bodyBuffer.slice(firstChunk.length)
+      this.lastAcceptedFull = sendable
+      return
     }
 
-    while (this.bodyBuffer) {
-      if (final && this.bodyBuffer.length <= this.opts.chunkSize) {
-        try {
-          await this.sendFinalShard()
-        } catch {
-          this.markFailed()
-        }
+    if (sendable === this.lastAcceptedFull) {
+      if (!final) return
+      // 无新增内容也要补 DONE 帧（replace+全量+state10，内容幂等）
+      try {
+        await this.sendBodyFrame(sendable, 10)
+      } catch (err) {
+        console.error("[stream] 终片失败:", err instanceof Error ? err.message : String(err))
+        this.markFailed()
+      }
+      return
+    }
+
+    if (!sendable.startsWith(this.lastAcceptedFull)) {
+      // 官方 prefixMatches 检查：模型改写了已下发文本 → 冲突终局
+      console.error("[stream] 新全量文本不是已下发文本的前缀延伸，结束流并回退全量")
+      await this.endStreamAsFailed()
+      return
+    }
+    if (!final && sendable.length - this.lastAcceptedFull.length < MIN_FLUSH_CHARS) return
+
+    try {
+      await this.sendBodyFrame(sendable, final ? 10 : 1)
+    } catch (err) {
+      if (classifyStreamError(err) === "prefix-conflict") {
+        await this.endStreamAsFailed()
         return
       }
-      if (!final && this.bodyBuffer.length < MIN_FLUSH_CHARS) return
-      const chunk = this.bodyBuffer.slice(0, this.opts.chunkSize)
-      try {
-        await this.sendAppendWithRetry(chunk, 1)
-      } catch {
+      if (final || classifyStreamError(err) !== "rate-limited") {
+        console.error("[stream] 正文分片失败:", err instanceof Error ? err.message : String(err))
         this.markFailed()
         return
       }
-      this.bodyDelivered += chunk
-      this.bodyBuffer = this.bodyBuffer.slice(chunk.length)
-    }
-
-    if (final && this.bodyStreamActive) {
-      // 缓冲已冲刷完：补一个空终片标记流结束
-      try {
-        await this.sendFinalShard()
-      } catch {
-        this.markFailed()
-      }
+      // 频控重试耗尽：跳过该帧，lastAcceptedFull 不推进（不丢内容：finish 比对失败 → 回退全量；
+      // replace 全量语义下后续任一成功帧即自愈补齐全部欠账）
+      console.error("[stream] 正文分片频控重试耗尽，跳过该帧（内容不丢：finish 比对失败将回退全量）")
     }
   }
 
@@ -678,7 +758,7 @@ export class StreamSession {
         this._state !== "streaming" ||
         this.activeScene !== "WAITING" ||
         this.bodyStreamActive ||
-        this.bodyBuffer !== ""
+        this.rawBody !== ""
       ) {
         return
       }
@@ -689,7 +769,7 @@ export class StreamSession {
           this._state !== "streaming" ||
           this.activeScene !== "WAITING" ||
           this.bodyStreamActive ||
-          this.bodyBuffer !== "" ||
+          this.rawBody !== "" ||
           !this.streamMsgId
         ) {
           return
@@ -700,7 +780,7 @@ export class StreamSession {
             index: this.nextIndex,
             inputMode: "replace",
             inputState: 1,
-            contentType: "text",
+            contentType: STREAM_CONTENT_TYPE,
             streamMsgId: this.streamMsgId,
             msgSeq: this.msgSeq,
           })

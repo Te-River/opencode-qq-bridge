@@ -248,7 +248,7 @@ export interface StreamShard {
   index: number // 从 0 递增（每条流独立计数）
   inputMode: "append" | "replace"
   inputState: 1 | 10 // 1=生成中 10=结束
-  contentType?: "text" | "markdown" // 默认 "text"（首版固定 text，字段留扩展）
+  contentType?: "text" | "markdown" // 缺省 "text"；调用方（sender）按 MARKDOWN 开关传 markdown/text
   streamMsgId?: string // index>0 时必填（=首片响应 id）
   msgId?: string // 首片被动锚定
   eventId?: string
@@ -286,7 +286,7 @@ export async function sendStreamMessage(
   return apiRequest<StreamShardResponse>(accessToken, "POST", `/v2/users/${openid}/stream_messages`, body, undefined, fetchImpl)
 }
 
-/** 流式错误分类：40007→前缀冲突；50002→频控；50001→服务端错误；其他 QQApiError→http；网络/超时→network */
+/** 流式错误分类：40007→前缀冲突；50002/HTTP 429→频控；50001→服务端错误；其他 QQApiError→http；网络/超时→network */
 export type StreamErrorKind =
   | "prefix-conflict"
   | "rate-limited"
@@ -298,7 +298,7 @@ export type StreamErrorKind =
 export function classifyStreamError(err: unknown): StreamErrorKind {
   if (err instanceof QQApiError) {
     if (err.code === 40007) return "prefix-conflict"
-    if (err.code === 50002) return "rate-limited"
+    if (err.code === 50002 || err.status === 429) return "rate-limited"
     if (err.code === 50001) return "server-error"
     return "http"
   }

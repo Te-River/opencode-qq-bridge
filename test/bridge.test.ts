@@ -244,7 +244,8 @@ describe("bridge STREAMING=on（C2C）", () => {
     expect(ss[0]).toMatchObject({ content_raw: "请等待中", index: 0, input_mode: "replace", input_state: 1, msg_id: "MID1" })
     expect(ss[1]).toMatchObject({ input_mode: "append", input_state: 10 })
     expect(ss[2]).toMatchObject({ content_raw: body, index: 0, input_mode: "replace", input_state: 1, msg_id: "MID1" })
-    expect(ss[3]).toMatchObject({ input_mode: "append", input_state: 10 })
+    // 正文终片 = replace + 全量 + state10（官方 update() 全文语义）
+    expect(ss[3]).toMatchObject({ content_raw: body, input_mode: "replace", input_state: 10 })
     // 同一流 msg_seq 恒定
     expect(ss[0].msg_seq).toBe(ss[1].msg_seq)
     expect(ss[2].msg_seq).toBe(ss[3].msg_seq)
@@ -280,5 +281,30 @@ describe("bridge STREAMING=on（C2C）", () => {
     expect(msgs).toHaveLength(1)
     expect(markdownContent(msgs[0].body)).toContain("文件发送失败")
     expect(markdownContent(msgs[0].body)).not.toContain(body)
+  })
+
+  test("思考标签：finish 基准叠加剥离（与流式缓冲共用同一函数），不误走全量回退", async () => {
+    const router = new FakeRouter()
+    const bridge = createBridge(
+      makeConfig({ streaming: { enabled: true, intervalMs: 200 } }),
+      makeClient(),
+      router as unknown as EventRouter,
+      makeSessions(),
+    )
+    const body = "这是最终结论".repeat(6) // 36 字符 ≥ 24
+    const reply = body + "<thinking>内部推理不应外泄</thinking>"
+    await runConversation(bridge, router, c2cCtx(), [
+      ev("session.text.started"),
+      ev("session.text.delta", { delta: reply }),
+      ev("session.text.ended", { text: reply }),
+      ev("session.idle"),
+    ])
+    await waitFor(() => apiCalls.filter((c) => c.url.includes("stream_messages")).length >= 4)
+    const ss = apiCalls.filter((c) => c.url.includes("stream_messages")).map((c) => c.body)
+    const streamed = ss.map((s) => s.content_raw as string).join("")
+    expect(streamed).toContain(body)
+    expect(streamed).not.toContain("内部推理")
+    // finish 基准 = 剥思考标签后的文本 → 比对成功，不发全量回复
+    expect(apiCalls.filter((c) => c.url.endsWith("/v2/users/U1/messages"))).toHaveLength(0)
   })
 })

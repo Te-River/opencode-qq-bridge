@@ -65,7 +65,7 @@ function firstShard(): StreamShard {
     index: 0,
     inputMode: "replace",
     inputState: 1,
-    contentType: "text",
+    contentType: "markdown",
     msgId: "MID1",
     msgSeq: 42,
   }
@@ -90,7 +90,7 @@ describe("sendStreamMessage 首片请求体", () => {
       index: 0,
       input_mode: "replace",
       input_state: 1,
-      content_type: "text",
+      content_type: "markdown",
       msg_seq: 42,
       msg_id: "MID1",
     })
@@ -168,6 +168,13 @@ describe("QQApiError 与 classifyStreamError", () => {
     let caught: unknown
     await sendWith(429, { code: 50002, message: "rate limited" }).catch((e) => { caught = e })
     expect((caught as QQApiError).code).toBe(50002)
+    expect(classifyStreamError(caught)).toBe("rate-limited")
+  })
+  test("HTTP 429（无业务码）→ rate-limited（官方频控重试口径）", async () => {
+    let caught: unknown
+    await sendWith(429, { message: "too many requests" }).catch((e) => { caught = e })
+    expect((caught as QQApiError).status).toBe(429)
+    expect((caught as QQApiError).code).toBeUndefined()
     expect(classifyStreamError(caught)).toBe("rate-limited")
   })
   test("50001 → server-error", async () => {
