@@ -30,7 +30,7 @@ export interface StreamingConfig {
 /** 「正在输入」状态提示（仅私聊；独立于 STREAMING，不改变任何消息内容） */
 export interface InputNotifyConfig {
   enabled: boolean // INPUT_NOTIFY，默认 on
-  seconds: number // INPUT_NOTIFY_SECONDS，默认 10（API input_second 上限 60，钳制）
+  seconds: number // INPUT_NOTIFY_SECONDS，默认 60（官方 input_second 上限；每回合只发一次，见 input-notify.ts）
 }
 
 export interface Config {
@@ -118,7 +118,7 @@ export async function ensureConfig(): Promise<void> {
     `# STREAMING_CHUNK_SIZE=500`,
     `# STREAMING_MAX_SCENES=3`,
     `# INPUT_NOTIFY=on`,
-    `# INPUT_NOTIFY_SECONDS=10`,
+    `# INPUT_NOTIFY_SECONDS=60`,
     `# PROGRESS_TOOL_CALL=on`,
     `# TEXT_WAITING=请稍候{dots}`,
     `# TEXT_TOOL_CALL=🔧 调用工具：{tool}`,
@@ -206,8 +206,8 @@ export function loadConfig(): Config {
     },
     inputNotify: {
       enabled: (process.env.INPUT_NOTIFY ?? "on").toLowerCase() !== "off",
-      // NaN/0 回落 10；钳制 [1, 60]（API input_second 上限 60 秒）
-      seconds: Math.min(60, Math.max(1, parseInt(process.env.INPUT_NOTIFY_SECONDS ?? "10", 10) || 10)),
+      // NaN/0 回落 60；钳制 [1, 60]（API input_second 上限 60 秒；每回合只发一次，默认取满上限）
+      seconds: Math.min(60, Math.max(1, parseInt(process.env.INPUT_NOTIFY_SECONDS ?? "60", 10) || 60)),
     },
     texts,
   }

@@ -1,6 +1,6 @@
 // sender.test.ts — StreamSession 状态机：首片/场景切换/节流/错误恢复/收尾/sendfile 标记与思考标签剥离
 // 正文路径为官方 SDK 语义：replace + 全量文本（每帧携带当前累计全文，index 每帧递增）。
-import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test"
 import { StreamSession, sendFileToQQ, detectUrlFileType, isHttpUrl, type StreamSessionOptions } from "../src/qq/sender.js"
 import { renderCopy } from "../src/copy.js"
 import type { MessageContext } from "../src/qq/types.js"
@@ -154,11 +154,11 @@ describe("StreamSession.switchScene", () => {
     await s.switchScene("TOOL_CALL", { tool: "bash" })
     const list = shards(calls)
     expect(list).toHaveLength(3)
-    // 旧流终片
+    // 旧流终片：官方 close 形状 = replace + 该流最后成功内容 + state10（真机 404 修复）
     expect(list[1]).toMatchObject({
-      content_raw: "",
+      content_raw: "请稍候",
       index: 1,
-      input_mode: "append",
+      input_mode: "replace",
       input_state: 10,
       stream_msg_id: "id-1",
     })
@@ -195,14 +195,14 @@ describe("StreamSession.switchScene", () => {
     expect(s.state).toBe("streaming")
   })
 
-  test("正文流进行中 switchScene(TEXT) 重置正文流：全量终片 + deliveredBody 清零 + 下段 index0", async () => {
+  test("正文流进行中 switchScene(TEXT) 重置正文流：全量终片 + deliveredBody 清零", async () => {
     const { calls, fetchImpl } = makeRecorder()
     const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
     await s.start()
     await s.pushBody(A40)
     await s.switchScene("TEXT", { snippet: "x" })
     expect(s.deliveredBody).toBe("")
-    let list = shards(calls)
+    const list = shards(calls)
     // 段落终片 = replace + 该段全量 + state10
     expect(list[3]).toMatchObject({
       content_raw: A40,
@@ -210,17 +210,11 @@ describe("StreamSession.switchScene", () => {
       input_state: 10,
       stream_msg_id: "id-3",
     })
-    // 下一段正文另起新流
+    // 默认预算（INPUT_NOTIFY=on → 2）已用尽（WAITING + 本段正文）：下一段只缓冲不开流；
+    // 「下段另起新流 index0」的预算内行为由开流预算用例的 off 实例覆盖
     await s.pushBody(B40)
-    list = shards(calls)
-    expect(list[4]).toMatchObject({
-      content_raw: B40,
-      index: 0,
-      input_mode: "replace",
-      input_state: 1,
-      msg_id: "MID1",
-    })
-    expect(s.deliveredBody).toBe(B40)
+    expect(shards(calls)).toHaveLength(4)
+    expect(s.deliveredBody).toBe("")
   })
 
   test("正文流进行中其他场景走主动消息且不打断正文流", async () => {
@@ -246,7 +240,7 @@ describe("StreamSession.switchScene", () => {
   })
 })
 
-// ---- 开流预算（占位+正文合并核算，MAX_STREAM_OPENS = 4 - 1 = 3） --------------------------
+// ---- 开流预算（占位+正文合并核算，INPUT_NOTIFY=on → MAX_STREAM_OPENS = 4 - 1状态 - 1兜底 = 2） ------
 
 describe("StreamSession 开流预算", () => {
   test("[MAJOR] 连续多段 TEXT 重置：开流总数 ≤ 预算，超预算后无 msg_id 新流首片，finish false 且兜底可走", async () => {
@@ -258,22 +252,23 @@ describe("StreamSession 开流预算", () => {
       return new Response(JSON.stringify({ id: "p1", timestamp: 1 }), { status: 200 })
     }) as typeof fetch
     const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
-    await s.start() // WAITING：开流 1/3
+    await s.start() // WAITING：开流 1/2（INPUT_NOTIFY=on：1 状态 + 2 开流 + 1 兜底 = 4）
     const segs = [A40, B40, C40, "D".repeat(40), "E".repeat(40)]
     for (const seg of segs) {
       await s.pushBody(seg)
       await s.switchScene("TEXT", { snippet: "x" })
     }
     const list = okShards(calls)
-    // 开流总数 = WAITING + 预算内 2 段正文 = 3 ≤ MAX_STREAM_OPENS（被动 4 次预留 1 次兜底）
+    // 开流总数 = WAITING + 预算内 1 段正文 = 2 ≤ MAX_STREAM_OPENS（被动 4 次 = 1 状态 + 2 开流 + 1 兜底）
     // 每片都带 msg_id，开流以 index0 识别
     const opens = list.filter((x) => x.index === 0)
-    expect(opens).toHaveLength(3)
-    expect(opens.map((x) => x.content_raw)).toEqual(["请稍候", A40, B40])
-    // 第 3 段起预算用尽：不再有新开流首片（后续分片至多复用流内 stream_msg_id）
-    const lastOpenIdx = list.findIndex((x) => x.content_raw === B40 && x.index === 0)
+    expect(opens).toHaveLength(2)
+    expect(opens.map((x) => x.content_raw)).toEqual(["请稍候", A40])
+    // 第 2 段起预算用尽：不再有新开流首片（后续分片至多复用流内 stream_msg_id）
+    const lastOpenIdx = list.findIndex((x) => x.content_raw === A40 && x.index === 0)
     expect(list.slice(lastOpenIdx + 1).every((x) => x.index > 0)).toBe(true)
-    // 超预算段落只缓冲不发送：第 3~5 段正文从未出现在任何流式分片里
+    // 超预算段落只缓冲不发送：第 2~5 段正文从未出现在任何流式分片里
+    expect(sentText(calls)).not.toContain(B40)
     expect(sentText(calls)).not.toContain(C40)
     // 场景降级为主动消息（不带 msg_id，不占被动名额）
     expect(proactive.length).toBeGreaterThanOrEqual(1)
@@ -288,26 +283,33 @@ describe("StreamSession 开流预算", () => {
     expect((replies[0].body.markdown as { content: string }).content).toContain("E".repeat(40))
   })
 
-  test("预算内 TEXT 重置行为不变：每段仍另起新流首片（index0/msg_id），deliveredBody 跟随本段", async () => {
-    const { calls, fetchImpl } = makeRecorder()
-    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
-    await s.start()
-    await s.pushBody(A40)
-    await s.switchScene("TEXT", { snippet: "x" })
-    await s.pushBody(B40)
-    const opens = okShards(calls).filter((x) => x.index === 0)
-    // WAITING + 2 段正文 = 3 次开流，均在预算内：重置语义与既有行为一致
-    expect(opens).toHaveLength(3)
-    expect(opens[2]).toMatchObject({
-      content_raw: B40,
-      index: 0,
-      input_mode: "replace",
-      input_state: 1,
-      msg_id: "MID1",
-    })
-    expect(s.deliveredBody).toBe(B40)
-    expect(s.state).toBe("streaming")
-    expectMsgSeqConstantPerStream(okShards(calls))
+  test("INPUT_NOTIFY=off → 上限 3（query 独立实例）：WAITING + 2 段正文预算内，重置语义不变", async () => {
+    process.env.INPUT_NOTIFY = "off"
+    try {
+      const spec: string = "../src/qq/sender.js?inputnotify=off"
+      const mod = (await import(spec)) as typeof import("../src/qq/sender.js")
+      const { calls, fetchImpl } = makeRecorder()
+      const s = track(new mod.StreamSession(baseOpts(fetchImpl, autoClock(1500))))
+      await s.start()
+      await s.pushBody(A40)
+      await s.switchScene("TEXT", { snippet: "x" })
+      await s.pushBody(B40)
+      const opens = okShards(calls).filter((x) => x.index === 0)
+      // WAITING + 2 段正文 = 3 次开流（off：无输入状态名额），均在预算内：重置语义与既有行为一致
+      expect(opens).toHaveLength(3)
+      expect(opens[2]).toMatchObject({
+        content_raw: B40,
+        index: 0,
+        input_mode: "replace",
+        input_state: 1,
+        msg_id: "MID1",
+      })
+      expect(s.deliveredBody).toBe(B40)
+      expect(s.state).toBe("streaming")
+      expectMsgSeqConstantPerStream(okShards(calls))
+    } finally {
+      delete process.env.INPUT_NOTIFY
+    }
   })
 })
 
@@ -417,8 +419,8 @@ describe("StreamSession 错误恢复", () => {
     await s.pushBody(A40)
     await s.pushBody(B40) // 全量帧撞 40007 → 结束流 + failed
     const list = shards(calls)
-    // 冲突终片：append+空+state10（不改写已下发内容）
-    expect(list[list.length - 1]).toMatchObject({ input_mode: "append", input_state: 10 })
+    // 冲突终片：replace + 最后成功下发内容 + state10（官方 close 形状，内容幂等不改写）
+    expect(list[list.length - 1]).toMatchObject({ content_raw: A40, input_mode: "replace", input_state: 10 })
     // 不再另起新流续传：新开流首片（index0）只有 WAITING 与正文 open 两个
     expect(list.filter((x) => x.index === 0)).toHaveLength(2)
     expect(s.state).toBe("failed")
@@ -429,6 +431,34 @@ describe("StreamSession 错误恢复", () => {
     const callsBefore = calls.length
     await s.pushBody(C40)
     expect(calls.length).toBe(callsBefore)
+  })
+
+  test("占位流终片 404「已经提交」→ 良性忽略：日志降级 console.log，流程不变（真机修复）", async () => {
+    const { calls, fetchImpl } = makeRecorder((body) => {
+      // 占位流终片（replace+state10+stream_msg_id）撞 404：平台已自动终局该流
+      if (body.input_mode === "replace" && body.input_state === 10 && body.stream_msg_id) {
+        return new Response(JSON.stringify({ message: "已经提交的消息内容不可修改" }), { status: 404 })
+      }
+      return undefined
+    })
+    const logSpy = jest.spyOn(console, "log").mockImplementation(() => {})
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => {})
+    try {
+      const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
+      await s.start()
+      await s.pushBody("短文本") // 不足 24 字符，不开正文流
+      const ok = await s.finish("短文本") // 占位流终片 → 404
+      expect(ok).toBe(false) // 短文本从未流式投递（既有语义，与 404 无关）
+      expect(s.state).toBe("finished")
+      // 良性降级：console.log 提及平台已终局，不再走 console.error
+      const benign = logSpy.mock.calls.filter((c) => String(c[0]).includes("已经提交"))
+      expect(benign).toHaveLength(1)
+      const errors = errSpy.mock.calls.filter((c) => String(c[0]).includes("占位流终片失败"))
+      expect(errors).toHaveLength(0)
+    } finally {
+      logSpy.mockRestore()
+      errSpy.mockRestore()
+    }
   })
 
   test("[PRODUCT_BUG1] deliveredBody 恒等于最后成功帧的全量文本（无重复累计）", async () => {
@@ -463,7 +493,8 @@ describe("StreamSession 错误恢复", () => {
     await s.start()
     await s.pushBody(A40)
     await s.pushBody(B40) // 首次 50002 → 退避 → 重试成功
-    const contFrames = shards(calls).filter((x) => x.input_mode === "replace" && x.index >= 1 && x.stream_msg_id)
+    // 正文续帧（state1）：占位流终片同为 replace 形状，按 input_state 区分
+    const contFrames = shards(calls).filter((x) => x.input_mode === "replace" && x.input_state === 1 && x.index >= 1 && x.stream_msg_id)
     // 官方语义：重试时 index 前进（首试 index1，重试 index2）
     expect(contFrames.map((x) => x.index)).toEqual([1, 2])
     expect(contFrames[1].content_raw).toBe(A40 + B40)
@@ -475,7 +506,8 @@ describe("StreamSession 错误恢复", () => {
 
   test("[PRODUCT_BUG2] 50002 三次重试全失败 → lastAcceptedFull 不推进、finish false → 回退全量", async () => {
     const { calls, fetchImpl } = makeRecorder((body) => {
-      // 正文续帧（含终片）持续频控；首片（index0/msg_id）与占位流不受影响
+      // 正文续帧（含终片）持续频控；首片（index0/msg_id）不受影响；占位流终片
+      // （新 close 形状同为 replace+index≥1）也会撞频控，失败被 flushBody 捕获忽略后照常开正文流
       if (body.input_mode === "replace" && body.index >= 1 && body.stream_msg_id) {
         return new Response(JSON.stringify({ code: 50002, message: "rate limited" }), { status: 429 })
       }
@@ -486,7 +518,8 @@ describe("StreamSession 错误恢复", () => {
     await s.pushBody(A40) // 开流成功
     await s.pushBody(B40) // 1+3 次尝试全 50002 → 跳帧
     await s.pushBody(C40) // 再 1+3 次尝试全 50002 → 跳帧
-    const contFrames = shards(calls).filter((x) => x.input_mode === "replace" && x.index >= 1 && x.stream_msg_id)
+    // 正文续帧（state1）：占位流终片（state10）同为 replace 形状，按 input_state 区分
+    const contFrames = shards(calls).filter((x) => x.input_mode === "replace" && x.input_state === 1 && x.index >= 1 && x.stream_msg_id)
     // 每轮 = 首试 + 3 次重试（index 前进），两轮共 8 次
     expect(contFrames.map((x) => x.index)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
     // 契约（Bug 2 意图，replace 形态）：频控耗尽后 lastAcceptedFull 不推进——

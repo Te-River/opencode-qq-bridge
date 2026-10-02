@@ -257,12 +257,16 @@ const RATE_LIMIT_BACKOFF_BASE_MS = 1000
  * 开流总次数上限（占位流 + 正文流合并核算）。
  * 算术：QQ 单聊被动回复每个 msg_id 最多 4 次；每个分片都带 msg_id（官方 SDK 语义，
  * 真机实测缺 msg_id 的续片报 50015001），但去重锚定为 msg_id+msg_seq——openStream 换新
- * msg_seq 才消耗名额，流内后续分片共享同 msg_seq 不消耗。fallbackToReply 的全量兜底
- * 同为该 msg_id 的被动回复，保守预留 1 个名额 ⇒ 占位 + 正文的总开流次数 ≤ 4 - 1 = 3。
+ * msg_seq 才消耗名额，流内后续分片共享同 msg_seq 不消耗。INPUT_NOTIFY=on 时输入状态
+ * 恰好占 1 个名额（每回合一次，见 input-notify.ts），fallbackToReply 的全量兜底同为该
+ * msg_id 的被动回复，保守预留 1 个名额 ⇒ 占位 + 正文的总开流次数 ≤ 4 - 1(状态) - 1(兜底) = 2；
+ * INPUT_NOTIFY=off 时无状态开销 ⇒ ≤ 4 - 1 = 3。env 读取与 config.inputNotify.enabled
+ * 同键同默认（on），模块级读取对齐 MARKDOWN_ENABLED 约定。
  * 用尽后：场景文案走主动消息（与 maxScenes 用尽同款降级），正文只缓冲不发送，
  * finish 比对失败 → bridge 全量兜底，内容不丢、预算不超。
  */
-const MAX_STREAM_OPENS = 3
+const INPUT_NOTIFY_ENABLED = (process.env.INPUT_NOTIFY ?? "on").toLowerCase() !== "off"
+const MAX_STREAM_OPENS = INPUT_NOTIFY_ENABLED ? 2 : 3
 
 /** 等待动画帧序列：前缀单调递增，满足 40007「已下发前缀不可修改」约束 */
 const DOTS_FRAMES = ["", ".", "..", "..."] as const
@@ -359,6 +363,25 @@ function trailingThinkingFragment(text: string): string {
   return ""
 }
 
+/**
+ * 终片 404「已经提交」= 平台已自动终局该流（终片迟到）：良性。
+ * 真机实测占位流终片报 404 {"message":"已经提交的消息内容不可修改"}；流程本就忽略
+ * 终片失败，这里只把日志从 error 降级为 log，避免真机日志误报。
+ */
+function isAlreadySubmittedError(err: unknown): boolean {
+  const status = (err as { status?: number } | null)?.status
+  return status === 404 && err instanceof Error && err.message.includes("已经提交")
+}
+
+/** 终片失败日志：404「已经提交」良性降级为 console.log，其余保持 console.error */
+function logCloseFailure(label: string, err: unknown): void {
+  if (isAlreadySubmittedError(err)) {
+    console.log(`[stream] ${label}：流已被平台自动终局（404 已经提交），忽略`)
+    return
+  }
+  console.error(`[stream] ${label}:`, err instanceof Error ? err.message : String(err))
+}
+
 export interface StreamSessionOptions {
   token: () => Promise<string> // 惰性取 token（复用 getAccessToken 缓存），勿存字符串
   ctx: MessageContext // 仅 C2C；构造时校验，群聊抛错（双保险，bridge 侧已按 ctx.type 过滤）
@@ -397,6 +420,7 @@ export class StreamSession {
   private bodyStreamActive = false
   private rawBody = "" // 当前段正文全量累计（未剥离；剥离在 flush 时对全量重算，无「部分消费」状态）
   private lastAcceptedFull = "" // 最后一次成功下发的全量正文（剥离后基准；deliveredBody 的唯一真理源）
+  private lastSentContent = "" // 当前流最后成功下发的全量内容（占位文案或 renderBody 全量；终片 replace 用）
   private activeScene: Scene | null = null
   private dotsFrame = 0
   private dotsTimer: ReturnType<typeof setInterval> | null = null
@@ -484,7 +508,7 @@ export class StreamSession {
         try {
           await this.closeStream()
         } catch (err) {
-          console.error("[stream] 旧流终片失败（忽略）:", err instanceof Error ? err.message : String(err))
+          logCloseFailure("旧流终片失败（忽略）", err)
         }
       }
       try {
@@ -539,7 +563,7 @@ export class StreamSession {
           try {
             await this.closeStream()
           } catch (err) {
-            console.error("[stream] 占位流终片失败（忽略）:", err instanceof Error ? err.message : String(err))
+            logCloseFailure("占位流终片失败（忽略）", err)
           }
         }
         this.finishResult = finalText.trim() === ""
@@ -628,6 +652,7 @@ export class StreamSession {
         })
         this.streamMsgId = res.id
         this.nextIndex = 1
+        this.lastSentContent = content
         return
       } catch (err) {
         if (classifyStreamError(err) === "rate-limited" && retry < RATE_LIMIT_RETRIES) {
@@ -639,13 +664,16 @@ export class StreamSession {
     }
   }
 
-  /** 旧流终片：state10 空内容标记结束（append+空串不改写已下发内容） */
+  /**
+   * 旧流终片：官方 streaming.ts 的 close 形状 = replace + 该流最后成功下发的全量内容 + state10
+   * （真机实测 append+空内容报 404「已经提交的消息内容不可修改」）。内容与已下发一致，幂等不改写。
+   */
   private async closeStream(): Promise<void> {
     if (!this.streamMsgId) return
     await this.sendShard({
-      content: "",
+      content: this.lastSentContent,
       index: this.nextIndex,
-      inputMode: "append",
+      inputMode: "replace",
       inputState: 10,
       contentType: STREAM_CONTENT_TYPE,
       streamMsgId: this.streamMsgId,
@@ -664,11 +692,12 @@ export class StreamSession {
    */
   private async sendBodyFrame(sendable: string, state: 1 | 10): Promise<void> {
     if (!this.streamMsgId) throw new Error("[stream] 正文分片无活动流")
+    const rendered = this.renderBody(sendable)
     for (let retry = 0; ; retry++) {
       const index = this.nextIndex
       try {
         const res = await this.sendShard({
-          content: this.renderBody(sendable),
+          content: rendered,
           index,
           inputMode: "replace",
           inputState: state,
@@ -680,6 +709,7 @@ export class StreamSession {
         this.streamMsgId = res.id
         this.nextIndex = index + 1
         this.lastAcceptedFull = sendable
+        this.lastSentContent = rendered
         return
       } catch (err) {
         const kind = classifyStreamError(err)
@@ -709,7 +739,7 @@ export class StreamSession {
       try {
         await this.closeStream()
       } catch (err) {
-        console.error("[stream] 冲突终片失败（忽略）:", err instanceof Error ? err.message : String(err))
+        logCloseFailure("冲突终片失败（忽略）", err)
       }
     }
     this.markFailed()
@@ -770,7 +800,7 @@ export class StreamSession {
         try {
           await this.closeStream()
         } catch (err) {
-          console.error("[stream] 占位流终片失败（忽略）:", err instanceof Error ? err.message : String(err))
+          logCloseFailure("占位流终片失败（忽略）", err)
         }
       }
       try {
@@ -855,8 +885,9 @@ export class StreamSession {
           return
         }
         try {
+          const frameContent = this.opts.render("WAITING", { dots: frame })
           const res = await this.sendShard({
-            content: this.opts.render("WAITING", { dots: frame }),
+            content: frameContent,
             index: this.nextIndex,
             inputMode: "replace",
             inputState: 1,
@@ -867,6 +898,7 @@ export class StreamSession {
           })
           this.streamMsgId = res.id
           this.nextIndex++
+          this.lastSentContent = frameContent
         } catch (err) {
           console.error("[stream] 等待动画帧发送失败（忽略）:", err instanceof Error ? err.message : String(err))
         }

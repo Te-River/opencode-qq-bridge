@@ -1,4 +1,4 @@
-// input-notify.test.ts — 「正在输入」状态单元回归：续发节奏（假时钟）/ stop 消退 / 失败静默 / 门控
+// input-notify.test.ts — 「正在输入」状态单元回归：整回合恰好一次 / stop 零请求 / 失败静默 / 门控
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test"
 import { startInputNotify } from "../src/qq/input-notify.js"
 import type { Config } from "../src/config.js"
@@ -20,7 +20,7 @@ function installFetch(failNotify = false): void {
   }) as typeof fetch
 }
 
-/** 假时钟下冲刷微任务：mock fetch 全程微任务即可完成，让 fire() 的链走完 */
+/** 假时钟下冲刷微任务：mock fetch 全程微任务即可完成，让首发链走完 */
 async function flush(ticks = 50): Promise<void> {
   for (let i = 0; i < ticks; i++) await Promise.resolve()
 }
@@ -42,7 +42,7 @@ function makeConfig(over: { inputNotify?: Partial<Config["inputNotify"]> } = {})
       toolResult: false,
       toolResultMax: 300,
     },
-    inputNotify: { enabled: true, seconds: 10, ...over.inputNotify },
+    inputNotify: { enabled: true, seconds: 60, ...over.inputNotify },
     texts: {},
   }
 }
@@ -51,7 +51,7 @@ const c2cCtx = (): MessageContext => ({ type: "c2c", userId: "U1", msgId: "MID1"
 const notifyBodies = (): Array<Record<string, unknown>> =>
   apiCalls.filter((c) => c.body?.msg_type === 6).map((c) => c.body)
 
-describe("startInputNotify（假时钟）", () => {
+describe("startInputNotify（每回合一次）", () => {
   beforeEach(() => {
     apiCalls = []
     installFetch()
@@ -62,49 +62,47 @@ describe("startInputNotify（假时钟）", () => {
     globalThis.fetch = realFetch
   })
 
-  test("立即首发 → 每 0.8×seconds 续发 → stop 后不再续发", async () => {
+  test("整回合恰好一次 input_notify：不续发、stop() 零请求（真机 40034128 修复）", async () => {
     const handle = startInputNotify(c2cCtx(), makeConfig())
     await flush()
     expect(notifyBodies()).toHaveLength(1)
 
-    jest.advanceTimersByTime(7999)
+    // 超过 input_second 也不续发：状态自然消失为既定取舍（占位点动画仍在提供视觉反馈）
+    jest.advanceTimersByTime(120_000)
     await flush()
-    expect(notifyBodies()).toHaveLength(1) // 未满间隔不续发
-    jest.advanceTimersByTime(1)
-    await flush()
-    expect(notifyBodies()).toHaveLength(2) // 8000ms = 10s × 0.8
-
-    jest.advanceTimersByTime(8000)
-    await flush()
-    expect(notifyBodies()).toHaveLength(3)
+    expect(notifyBodies()).toHaveLength(1)
 
     await handle.stop()
-    expect(notifyBodies()).toHaveLength(4) // + 终止提示
-    jest.advanceTimersByTime(60000)
+    expect(notifyBodies()).toHaveLength(1) // stop 不发任何请求（含 input_second=1 消退）
+
+    jest.advanceTimersByTime(120_000)
     await flush()
-    expect(notifyBodies()).toHaveLength(4) // 定时器已清，不再续发
+    expect(notifyBodies()).toHaveLength(1)
   })
 
-  test("所有调用带 msg_id 被动锚定、input_type=1；stop() 发 input_second=1", async () => {
+  test("唯一一次调用带 msg_id 被动锚定、input_type=1、input_second=默认 60", async () => {
     const handle = startInputNotify(c2cCtx(), makeConfig())
     await flush()
     await handle.stop()
     const bodies = notifyBodies()
-    expect(bodies).toHaveLength(2)
-    for (const b of bodies) {
-      expect(b.msg_id).toBe("MID1") // 带 msg_id 被动锚定：QQ 渲染为纯状态而非 "null" 气泡
-      expect(b.input_notify).toMatchObject({ input_type: 1 })
-    }
-    expect(bodies[0].input_notify).toEqual({ input_type: 1, input_second: 10 })
-    expect(bodies[1].input_notify).toEqual({ input_type: 1, input_second: 1 })
+    expect(bodies).toHaveLength(1)
+    expect(bodies[0].msg_id).toBe("MID1") // 带 msg_id 被动锚定：QQ 渲染为纯状态而非 "null" 气泡
+    expect(bodies[0].input_notify).toEqual({ input_type: 1, input_second: 60 })
   })
 
-  test("stop() 幂等：重复调用不重复发终止提示", async () => {
+  test("INPUT_NOTIFY_SECONDS 透传自定义时长（钳制由 config 层负责）", async () => {
+    const handle = startInputNotify(c2cCtx(), makeConfig({ inputNotify: { seconds: 30 } }))
+    await flush()
+    await handle.stop()
+    expect(notifyBodies()[0].input_notify).toEqual({ input_type: 1, input_second: 30 })
+  })
+
+  test("stop() 幂等：重复调用零额外请求", async () => {
     const handle = startInputNotify(c2cCtx(), makeConfig())
     await flush()
     await handle.stop()
     await handle.stop()
-    expect(notifyBodies()).toHaveLength(2)
+    expect(notifyBodies()).toHaveLength(1)
   })
 
   test("发送失败：仅 console.error 一次，stop() 不抛出", async () => {
@@ -112,8 +110,6 @@ describe("startInputNotify（假时钟）", () => {
     const errSpy = jest.spyOn(console, "error").mockImplementation(() => {})
     try {
       const handle = startInputNotify(c2cCtx(), makeConfig())
-      await flush()
-      jest.advanceTimersByTime(8000)
       await flush()
       await handle.stop() // 失败被吞掉
       const errors = errSpy.mock.calls.filter((c) => String(c[0]).includes("[input-notify]"))
@@ -127,7 +123,7 @@ describe("startInputNotify（假时钟）", () => {
     const groupCtx: MessageContext = { type: "group", userId: "U1", groupId: "G1", msgId: "MID1", content: "你好" }
     await startInputNotify(groupCtx, makeConfig()).stop()
     await startInputNotify(c2cCtx(), makeConfig({ inputNotify: { enabled: false } })).stop()
-    jest.advanceTimersByTime(60000)
+    jest.advanceTimersByTime(120_000)
     await flush()
     expect(apiCalls.filter((c) => c.body?.msg_type === 6)).toHaveLength(0)
   })

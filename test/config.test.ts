@@ -88,20 +88,24 @@ describe("loadConfig progress 默认值与覆盖", () => {
 })
 
 describe("loadConfig inputNotify 默认值与钳制", () => {
-  test("INPUT_NOTIFY 默认 on，seconds 默认 10", () => {
+  test("INPUT_NOTIFY 默认 on，seconds 默认 60（官方上限，每回合只发一次）", () => {
     const n = loadConfig().inputNotify
     expect(n.enabled).toBe(true)
-    expect(n.seconds).toBe(10)
+    expect(n.seconds).toBe(60)
   })
   test("INPUT_NOTIFY=off 关闭", () => {
     process.env.INPUT_NOTIFY = "off"
     expect(loadConfig().inputNotify.enabled).toBe(false)
   })
-  test("INPUT_NOTIFY_SECONDS 超上限钳到 60，非法值回落 10", () => {
+  test("INPUT_NOTIFY_SECONDS 超上限钳到 60，非法值/0 回落 60", () => {
     process.env.INPUT_NOTIFY_SECONDS = "999"
     expect(loadConfig().inputNotify.seconds).toBe(60)
     process.env.INPUT_NOTIFY_SECONDS = "abc"
-    expect(loadConfig().inputNotify.seconds).toBe(10)
+    expect(loadConfig().inputNotify.seconds).toBe(60)
+    process.env.INPUT_NOTIFY_SECONDS = "0"
+    expect(loadConfig().inputNotify.seconds).toBe(60)
+    process.env.INPUT_NOTIFY_SECONDS = "5"
+    expect(loadConfig().inputNotify.seconds).toBe(5)
   })
 })
 

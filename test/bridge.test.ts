@@ -87,7 +87,7 @@ function makeConfig(
       ...over.progress,
     },
     // 默认 off：既有用例按 URL 断言 /messages 调用数，输入状态用例显式开启
-    inputNotify: { enabled: false, seconds: 10, ...over.inputNotify },
+    inputNotify: { enabled: false, seconds: 60, ...over.inputNotify },
     texts: {},
   }
 }
@@ -248,7 +248,8 @@ describe("bridge STREAMING=on（C2C）", () => {
     const ss = apiCalls.filter((c) => c.url.includes("stream_messages")).map((c) => c.body)
     expect(ss).toHaveLength(4)
     expect(ss[0]).toMatchObject({ content_raw: "请稍候", index: 0, input_mode: "replace", input_state: 1, msg_id: "MID1" })
-    expect(ss[1]).toMatchObject({ input_mode: "append", input_state: 10 })
+    // 占位流终片：官方 close 形状 = replace + 该流最后成功内容 + state10（真机 404 修复）
+    expect(ss[1]).toMatchObject({ content_raw: "请稍候", input_mode: "replace", input_state: 10 })
     expect(ss[2]).toMatchObject({ content_raw: body, index: 0, input_mode: "replace", input_state: 1, msg_id: "MID1" })
     // 正文终片 = replace + 全量 + state10（官方 update() 全文语义）
     expect(ss[3]).toMatchObject({ content_raw: body, input_mode: "replace", input_state: 10 })
@@ -320,7 +321,7 @@ describe("bridge STREAMING=on（C2C）", () => {
 // ---- 输入中状态（INPUT_NOTIFY）-----------------------------------------------
 
 describe("bridge 输入中状态（INPUT_NOTIFY，仅私聊）", () => {
-  test("回合开始发 msg_type=6（带 msg_id 被动锚定），回复投递后 stop() 发 input_second=1", async () => {
+  test("回合开始发 msg_type=6（带 msg_id 被动锚定），整回合恰好一次、stop() 零请求", async () => {
     const router = new FakeRouter()
     const bridge = createBridge(
       makeConfig({ inputNotify: { enabled: true } }),
@@ -334,18 +335,16 @@ describe("bridge 输入中状态（INPUT_NOTIFY，仅私聊）", () => {
       ev("session.text.ended", { text: "答案" }),
       ev("session.idle"),
     ])
-    // stop() 的终止提示到达 = finally 已执行完
-    await waitFor(() => apiCalls.some((c) => c.body?.msg_type === 6 && c.body?.input_notify?.input_second === 1))
+    // 回合结束标记：最终回复已投递（stop() 不再发任何请求，无终止提示可等）
+    await waitFor(() => apiCalls.some((c) => c.body?.msg_id === "MID1" && c.body?.msg_type !== 6))
+    await waitFor(() => apiCalls.some((c) => c.body?.msg_type === 6))
     const notifies = apiCalls.filter((c) => c.body?.msg_type === 6)
-    // 回合毫秒级完成，8s 续发间隔不触发：只有首发 + 终止
-    expect(notifies).toHaveLength(2)
-    for (const n of notifies) {
-      expect(n.url.endsWith("/v2/users/U1/messages")).toBe(true)
-      expect(n.body.msg_id).toBe("MID1") // 带 msg_id 被动锚定：QQ 渲染为纯状态而非 "null" 气泡
-      expect(n.body.input_notify).toMatchObject({ input_type: 1 })
-    }
-    expect(notifies[0].body.input_notify).toEqual({ input_type: 1, input_second: 10 })
-    expect(notifies[1].body.input_notify).toEqual({ input_type: 1, input_second: 1 })
+    // 整回合恰好一次（真机 40034128 修复：不续发、不消退，预算只占 1 个名额）
+    expect(notifies).toHaveLength(1)
+    const n = notifies[0]
+    expect(n.url.endsWith("/v2/users/U1/messages")).toBe(true)
+    expect(n.body.msg_id).toBe("MID1") // 带 msg_id 被动锚定：QQ 渲染为纯状态而非 "null" 气泡
+    expect(n.body.input_notify).toEqual({ input_type: 1, input_second: 60 })
     // 首发先于最终回复（回合开始即提示，且不依赖回复完成）
     const firstNotify = apiCalls.findIndex((c) => c.body?.msg_type === 6)
     const reply = apiCalls.findIndex((c) => c.body?.msg_id === "MID1" && c.body?.msg_type !== 6)
@@ -355,7 +354,7 @@ describe("bridge 输入中状态（INPUT_NOTIFY，仅私聊）", () => {
 
   test("input_notify 发送失败：不影响回合，错误仅记录一次", async () => {
     const router = new FakeRouter()
-    // 首发/续发返回 500；stop() 的终止提示（input_second=1）放行，作为回合结束的确定性标记
+    // input_notify 返回 500：失败被忽略，回合照常完成
     globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
       const u = String(url)
       if (u.includes("getAppAccessToken")) {
@@ -363,7 +362,7 @@ describe("bridge 输入中状态（INPUT_NOTIFY，仅私聊）", () => {
       }
       const body = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {}
       apiCalls.push({ url: u, body })
-      if (body.msg_type === 6 && (body.input_notify as { input_second?: number } | undefined)?.input_second !== 1) {
+      if (body.msg_type === 6) {
         return new Response(JSON.stringify({ message: "boom" }), { status: 500 })
       }
       return new Response(JSON.stringify({ id: "mid", timestamp: 1 }), { status: 200 })
@@ -384,9 +383,10 @@ describe("bridge 输入中状态（INPUT_NOTIFY，仅私聊）", () => {
       ])
       // 回合正常完成：最终回复照常投递（失败被忽略；排除 msg_type=6 的 input_notify）
       await waitFor(() => apiCalls.some((c) => c.body?.msg_id === "MID1" && c.body?.msg_type !== 6))
-      await waitFor(() => apiCalls.some((c) => c.body?.msg_type === 6 && c.body?.input_notify?.input_second === 1))
+      // 唯一一次 input_notify 的失败已记录（防刷屏：只记录一次）
+      await waitFor(() => errSpy.mock.calls.some((c) => String(c[0]).includes("[input-notify]")))
       const errors = errSpy.mock.calls.filter((c) => String(c[0]).includes("[input-notify]"))
-      expect(errors).toHaveLength(1) // 防刷屏：只记录一次
+      expect(errors).toHaveLength(1)
     } finally {
       errSpy.mockRestore()
     }
