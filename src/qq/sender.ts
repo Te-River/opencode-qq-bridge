@@ -257,16 +257,12 @@ const RATE_LIMIT_BACKOFF_BASE_MS = 1000
  * 开流总次数上限（占位流 + 正文流合并核算）。
  * 算术：QQ 单聊被动回复每个 msg_id 最多 4 次；每个分片都带 msg_id（官方 SDK 语义，
  * 真机实测缺 msg_id 的续片报 50015001），但去重锚定为 msg_id+msg_seq——openStream 换新
- * msg_seq 才消耗名额，流内后续分片共享同 msg_seq 不消耗。INPUT_NOTIFY=on 时输入状态
- * 恰好占 1 个名额（每回合一次，见 input-notify.ts），fallbackToReply 的全量兜底同为该
- * msg_id 的被动回复，保守预留 1 个名额 ⇒ 占位 + 正文的总开流次数 ≤ 4 - 1(状态) - 1(兜底) = 2；
- * INPUT_NOTIFY=off 时无状态开销 ⇒ ≤ 4 - 1 = 3。env 读取与 config.inputNotify.enabled
- * 同键同默认（on），模块级读取对齐 MARKDOWN_ENABLED 约定。
+ * msg_seq 才消耗名额，流内后续分片共享同 msg_seq 不消耗。fallbackToReply 的全量兜底
+ * 同为该 msg_id 的被动回复，保守预留 1 个名额 ⇒ 占位 + 正文的总开流次数 ≤ 4 - 1 = 3。
  * 用尽后：场景文案走主动消息（与 maxScenes 用尽同款降级），正文只缓冲不发送，
  * finish 比对失败 → bridge 全量兜底，内容不丢、预算不超。
  */
-const INPUT_NOTIFY_ENABLED = (process.env.INPUT_NOTIFY ?? "on").toLowerCase() !== "off"
-const MAX_STREAM_OPENS = INPUT_NOTIFY_ENABLED ? 2 : 3
+const MAX_STREAM_OPENS = 3
 
 /** 等待动画帧序列：前缀单调递增，满足 40007「已下发前缀不可修改」约束 */
 const DOTS_FRAMES = ["", ".", "..", "..."] as const

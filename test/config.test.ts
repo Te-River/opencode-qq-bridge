@@ -7,7 +7,6 @@ const ENV_KEYS = [
   "ALLOWED_USERS", "MAX_REPLY_LENGTH",
   "OPENCODE_BASE_URL", "OPENCODE_WORKSPACE",
   "STREAMING", "STREAMING_INTERVAL_MS", "STREAMING_CHUNK_SIZE", "STREAMING_MAX_SCENES",
-  "INPUT_NOTIFY", "INPUT_NOTIFY_SECONDS",
   "PROGRESS", "PROGRESS_MAX", "PROGRESS_MIN_INTERVAL_MS", "PROGRESS_HEARTBEAT_MS",
   "PROGRESS_TEXT_MAX", "PROGRESS_TOOL_CALL", "PROGRESS_TOOL_RESULT", "PROGRESS_TOOL_RESULT_MAX",
   "TEXT_WAITING", "TEXT_TOOL_CALL", "TEXT_TOOL_RESULT", "TEXT_TOOL_FAILED",
@@ -84,28 +83,6 @@ describe("loadConfig progress 默认值与覆盖", () => {
   test("PROGRESS=off 关闭整体进度", () => {
     process.env.PROGRESS = "off"
     expect(loadConfig().progress.enabled).toBe(false)
-  })
-})
-
-describe("loadConfig inputNotify 默认值与钳制", () => {
-  test("INPUT_NOTIFY 默认 on，seconds 默认 60（官方上限，每回合只发一次）", () => {
-    const n = loadConfig().inputNotify
-    expect(n.enabled).toBe(true)
-    expect(n.seconds).toBe(60)
-  })
-  test("INPUT_NOTIFY=off 关闭", () => {
-    process.env.INPUT_NOTIFY = "off"
-    expect(loadConfig().inputNotify.enabled).toBe(false)
-  })
-  test("INPUT_NOTIFY_SECONDS 超上限钳到 60，非法值/0 回落 60", () => {
-    process.env.INPUT_NOTIFY_SECONDS = "999"
-    expect(loadConfig().inputNotify.seconds).toBe(60)
-    process.env.INPUT_NOTIFY_SECONDS = "abc"
-    expect(loadConfig().inputNotify.seconds).toBe(60)
-    process.env.INPUT_NOTIFY_SECONDS = "0"
-    expect(loadConfig().inputNotify.seconds).toBe(60)
-    process.env.INPUT_NOTIFY_SECONDS = "5"
-    expect(loadConfig().inputNotify.seconds).toBe(5)
   })
 })
 

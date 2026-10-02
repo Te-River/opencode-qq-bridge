@@ -195,14 +195,14 @@ describe("StreamSession.switchScene", () => {
     expect(s.state).toBe("streaming")
   })
 
-  test("正文流进行中 switchScene(TEXT) 重置正文流：全量终片 + deliveredBody 清零", async () => {
+  test("正文流进行中 switchScene(TEXT) 重置正文流：全量终片 + deliveredBody 清零 + 下段 index0", async () => {
     const { calls, fetchImpl } = makeRecorder()
     const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
     await s.start()
     await s.pushBody(A40)
     await s.switchScene("TEXT", { snippet: "x" })
     expect(s.deliveredBody).toBe("")
-    const list = shards(calls)
+    let list = shards(calls)
     // 段落终片 = replace + 该段全量 + state10
     expect(list[3]).toMatchObject({
       content_raw: A40,
@@ -210,11 +210,17 @@ describe("StreamSession.switchScene", () => {
       input_state: 10,
       stream_msg_id: "id-3",
     })
-    // 默认预算（INPUT_NOTIFY=on → 2）已用尽（WAITING + 本段正文）：下一段只缓冲不开流；
-    // 「下段另起新流 index0」的预算内行为由开流预算用例的 off 实例覆盖
+    // 下一段正文另起新流
     await s.pushBody(B40)
-    expect(shards(calls)).toHaveLength(4)
-    expect(s.deliveredBody).toBe("")
+    list = shards(calls)
+    expect(list[4]).toMatchObject({
+      content_raw: B40,
+      index: 0,
+      input_mode: "replace",
+      input_state: 1,
+      msg_id: "MID1",
+    })
+    expect(s.deliveredBody).toBe(B40)
   })
 
   test("正文流进行中其他场景走主动消息且不打断正文流", async () => {
@@ -240,7 +246,7 @@ describe("StreamSession.switchScene", () => {
   })
 })
 
-// ---- 开流预算（占位+正文合并核算，INPUT_NOTIFY=on → MAX_STREAM_OPENS = 4 - 1状态 - 1兜底 = 2） ------
+// ---- 开流预算（占位+正文合并核算，MAX_STREAM_OPENS = 4 - 1 = 3） --------------------------
 
 describe("StreamSession 开流预算", () => {
   test("[MAJOR] 连续多段 TEXT 重置：开流总数 ≤ 预算，超预算后无 msg_id 新流首片，finish false 且兜底可走", async () => {
@@ -252,23 +258,22 @@ describe("StreamSession 开流预算", () => {
       return new Response(JSON.stringify({ id: "p1", timestamp: 1 }), { status: 200 })
     }) as typeof fetch
     const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
-    await s.start() // WAITING：开流 1/2（INPUT_NOTIFY=on：1 状态 + 2 开流 + 1 兜底 = 4）
+    await s.start() // WAITING：开流 1/3
     const segs = [A40, B40, C40, "D".repeat(40), "E".repeat(40)]
     for (const seg of segs) {
       await s.pushBody(seg)
       await s.switchScene("TEXT", { snippet: "x" })
     }
     const list = okShards(calls)
-    // 开流总数 = WAITING + 预算内 1 段正文 = 2 ≤ MAX_STREAM_OPENS（被动 4 次 = 1 状态 + 2 开流 + 1 兜底）
+    // 开流总数 = WAITING + 预算内 2 段正文 = 3 ≤ MAX_STREAM_OPENS（被动 4 次预留 1 次兜底）
     // 每片都带 msg_id，开流以 index0 识别
     const opens = list.filter((x) => x.index === 0)
-    expect(opens).toHaveLength(2)
-    expect(opens.map((x) => x.content_raw)).toEqual(["请稍候", A40])
-    // 第 2 段起预算用尽：不再有新开流首片（后续分片至多复用流内 stream_msg_id）
-    const lastOpenIdx = list.findIndex((x) => x.content_raw === A40 && x.index === 0)
+    expect(opens).toHaveLength(3)
+    expect(opens.map((x) => x.content_raw)).toEqual(["请稍候", A40, B40])
+    // 第 3 段起预算用尽：不再有新开流首片（后续分片至多复用流内 stream_msg_id）
+    const lastOpenIdx = list.findIndex((x) => x.content_raw === B40 && x.index === 0)
     expect(list.slice(lastOpenIdx + 1).every((x) => x.index > 0)).toBe(true)
-    // 超预算段落只缓冲不发送：第 2~5 段正文从未出现在任何流式分片里
-    expect(sentText(calls)).not.toContain(B40)
+    // 超预算段落只缓冲不发送：第 3~5 段正文从未出现在任何流式分片里
     expect(sentText(calls)).not.toContain(C40)
     // 场景降级为主动消息（不带 msg_id，不占被动名额）
     expect(proactive.length).toBeGreaterThanOrEqual(1)
@@ -283,33 +288,26 @@ describe("StreamSession 开流预算", () => {
     expect((replies[0].body.markdown as { content: string }).content).toContain("E".repeat(40))
   })
 
-  test("INPUT_NOTIFY=off → 上限 3（query 独立实例）：WAITING + 2 段正文预算内，重置语义不变", async () => {
-    process.env.INPUT_NOTIFY = "off"
-    try {
-      const spec: string = "../src/qq/sender.js?inputnotify=off"
-      const mod = (await import(spec)) as typeof import("../src/qq/sender.js")
-      const { calls, fetchImpl } = makeRecorder()
-      const s = track(new mod.StreamSession(baseOpts(fetchImpl, autoClock(1500))))
-      await s.start()
-      await s.pushBody(A40)
-      await s.switchScene("TEXT", { snippet: "x" })
-      await s.pushBody(B40)
-      const opens = okShards(calls).filter((x) => x.index === 0)
-      // WAITING + 2 段正文 = 3 次开流（off：无输入状态名额），均在预算内：重置语义与既有行为一致
-      expect(opens).toHaveLength(3)
-      expect(opens[2]).toMatchObject({
-        content_raw: B40,
-        index: 0,
-        input_mode: "replace",
-        input_state: 1,
-        msg_id: "MID1",
-      })
-      expect(s.deliveredBody).toBe(B40)
-      expect(s.state).toBe("streaming")
-      expectMsgSeqConstantPerStream(okShards(calls))
-    } finally {
-      delete process.env.INPUT_NOTIFY
-    }
+  test("预算内 TEXT 重置行为不变：每段仍另起新流首片（index0/msg_id），deliveredBody 跟随本段", async () => {
+    const { calls, fetchImpl } = makeRecorder()
+    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
+    await s.start()
+    await s.pushBody(A40)
+    await s.switchScene("TEXT", { snippet: "x" })
+    await s.pushBody(B40)
+    const opens = okShards(calls).filter((x) => x.index === 0)
+    // WAITING + 2 段正文 = 3 次开流，均在预算内：重置语义与既有行为一致
+    expect(opens).toHaveLength(3)
+    expect(opens[2]).toMatchObject({
+      content_raw: B40,
+      index: 0,
+      input_mode: "replace",
+      input_state: 1,
+      msg_id: "MID1",
+    })
+    expect(s.deliveredBody).toBe(B40)
+    expect(s.state).toBe("streaming")
+    expectMsgSeqConstantPerStream(okShards(calls))
   })
 })
 

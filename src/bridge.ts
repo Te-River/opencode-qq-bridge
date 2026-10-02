@@ -5,7 +5,6 @@ import type { Config, ProgressConfig } from "./config.js"
 import { DEFAULT_PROGRESS } from "./config.js"
 import type { MessageContext } from "./qq/types.js"
 import { getAccessToken } from "./qq/api.js"
-import { startInputNotify } from "./qq/input-notify.js"
 import { replyToQQ, sendProactiveToQQ, sendFileToQQ, stripThinkingTags, StreamSession, isHttpUrl } from "./qq/sender.js"
 import { renderCopy, type Scene, type CopyVars } from "./copy.js"
 import { mkdirSync, writeFileSync } from "fs"
@@ -219,9 +218,6 @@ export function createBridge(
       return progressChain
     }
 
-    // 「正在输入」状态（仅私聊）：回合开始发一次（默认 60s）；finally 统一 stop()（零请求，仅清理）
-    const inputNotify = startInputNotify(ctx, config)
-
     try {
       if (stream) await stream.start().catch(() => {}) // start 失败→state=failed→后续自动走非流式
       if (stream && stream.state === "streaming") activeStreams.set(session.sessionId, stream)
@@ -262,7 +258,6 @@ export function createBridge(
       throw error
     } finally {
       activeStreams.delete(session.sessionId)
-      await inputNotify.stop()
     }
   }
 
