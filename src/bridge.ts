@@ -282,12 +282,14 @@ export function createBridge(
   ): Promise<void> {
     const { text: cleanText, files } = extractSendFiles(replyText)
     const sendFileErrors: string[] = []
+    const sendFileNotes: string[] = []
     if (files.length > 0) {
       const accessToken = await getAccessToken(config.qq.appId, config.qq.clientSecret)
       for (const file of files) {
         const filePath = resolveSendPath(file)
         try {
-          await sendFileToQQ(accessToken, ctx, filePath, SEND_FILE_MAX_BYTES)
+          const note = await sendFileToQQ(accessToken, ctx, filePath, SEND_FILE_MAX_BYTES)
+          if (note) sendFileNotes.push(note)
           console.log(`[bridge] 已向用户发送文件: ${filePath}`)
         } catch (error) {
           console.error(`[bridge] 发送文件失败 ${filePath}:`, toErrorMessage(error))
@@ -298,6 +300,7 @@ export function createBridge(
 
     const finalParts: string[] = []
     if (!textAlreadyDelivered && cleanText.trim()) finalParts.push(cleanText)
+    if (sendFileNotes.length > 0) finalParts.push(sendFileNotes.join("\n"))
     if (sendFileErrors.length > 0) finalParts.push(`⚠ 文件发送失败：\n${sendFileErrors.join("\n")}`)
     const finalText = finalParts.join("\n\n")
     if (!finalText.trim()) return
@@ -806,7 +809,10 @@ async function startSessionPrompt(
 
   if (SEND_FILE_HINT) {
     const hint =
-      "[系统提示] 需要把本地文件发给用户时，请在回复中单独一行写：[[sendfile:/绝对路径]]（多个文件用多行）。"
+      "[系统提示] 需要把本地文件发给用户时，请在回复中单独一行写：[[sendfile:/绝对路径]]（多个文件用多行）。\n" +
+      "文件大小：QQ 单次内联上传上限约 4MB，超过时桥会自动分片发送（会刷很多条、用户需手动合并）。" +
+      "大文件优先考虑：① 先压缩（如 zip -9）；② 提供公网 https URL（[[sendfile:https://...]]，由腾讯侧下载，不受 4MB 限制）；" +
+      "③ 确需原样发送才用本地路径。"
     promptText = promptText ? `${promptText}\n\n${hint}` : hint
   }
 

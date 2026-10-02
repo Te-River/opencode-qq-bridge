@@ -1,5 +1,5 @@
-// @input:  ./api (sendC2CMessage, sendGroupMessage, sendStreamMessage, classifyStreamError), ./types (MessageContext), ../copy (Scene, CopyVars)
-// @output: replyToQQ, formatForQQ, splitMessage, sendProactiveToQQ, stripThinkingTags, StreamSession
+// @input:  ./api (sendC2CMessage, sendGroupMessage, getNextMsgSeq, upload*/send*Media*, sendStreamMessage, classifyStreamError, QQApiError), ./types (MessageContext), ../copy (Scene, CopyVars)
+// @output: replyToQQ, formatForQQ, splitMessage, sendProactiveToQQ, stripThinkingTags, sendFileToQQ, splitFileParts, StreamSession
 // @pos:    qq层 - 消息发送 (Markdown格式化 + 分割 + 被动回复 + 流式会话状态机)
 import {
   sendC2CMessage,
@@ -13,11 +13,13 @@ import {
   sendGroupMediaMessage,
   sendStreamMessage,
   classifyStreamError,
+  QQApiError,
   type StreamShard,
   type StreamShardResponse,
 } from "./api.js"
-import { readFileSync, statSync } from "fs"
-import { basename } from "path"
+import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from "fs"
+import { tmpdir } from "os"
+import { basename, join } from "path"
 import type { MessageContext } from "./types.js"
 import type { Scene, CopyVars } from "../copy.js"
 
@@ -198,16 +200,126 @@ export function urlFileName(rawUrl: string): string | undefined {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 本地文件发送：内联 base64 上限 + 超限自动分片
+// ---------------------------------------------------------------------------
+
+/**
+ * QQ 富媒体 `file_data`（base64 内联）通道实测（2026-10，api.sgroup.qq.com）：
+ * - ≤4.5MB 文件（≈6MB 请求体）稳定 200；
+ * - 5~14MB 频繁 `500 call inner proxy error (850012)`（上传慢/网关超时）；
+ * - 请求体 ≥约 19~27MB 被网关 `stgw` 直接 `413 Request Entity Too Large`，无重试机会。
+ * 因此把安全阈值定为 4MB：超过就分片，绝不撞 500/413。
+ */
+const DEFAULT_INLINE_MAX_BYTES = 4 * 1024 * 1024
+const DEFAULT_PART_DELAY_MS = 800
+const DEFAULT_MAX_PARTS = 40
+const UPLOAD_RETRY_ATTEMPTS = 3
+
+/** 分片/阈值参数（调用时读 env，便于测试与热改） */
+function fileSendSettings(): {
+  inlineMaxBytes: number
+  split: boolean
+  partDelayMs: number
+  maxParts: number
+} {
+  const inlineMaxBytes = Number(process.env.SEND_FILE_INLINE_MAX_BYTES ?? DEFAULT_INLINE_MAX_BYTES)
+  return {
+    inlineMaxBytes: Number.isFinite(inlineMaxBytes) && inlineMaxBytes > 0 ? inlineMaxBytes : DEFAULT_INLINE_MAX_BYTES,
+    split: (process.env.SEND_FILE_SPLIT ?? "on").toLowerCase() !== "off",
+    partDelayMs: Number(process.env.SEND_FILE_PART_DELAY_MS ?? DEFAULT_PART_DELAY_MS),
+    maxParts: Number(process.env.SEND_FILE_MAX_PARTS ?? DEFAULT_MAX_PARTS),
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/** 上传/发送的有限重试：仅对网络错误、429、5xx 重试；4xx（含 413）与业务错误直接抛出 */
+async function withSendRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  let lastError: unknown
+  for (let attempt = 1; attempt <= UPLOAD_RETRY_ATTEMPTS; attempt++) {
+    try {
+      return await fn()
+    } catch (error) {
+      lastError = error
+      const status = error instanceof QQApiError ? error.status : 0
+      const retryable = status === 0 || status === 429 || status >= 500
+      if (!retryable || attempt === UPLOAD_RETRY_ATTEMPTS) break
+      console.warn(`[sender] ${label} 失败（状态 ${status}），${attempt}/${UPLOAD_RETRY_ATTEMPTS - 1} 次重试…`)
+      await sleep(1000 * attempt)
+    }
+  }
+  throw lastError
+}
+
+/** 上传单个本地文件并发富媒体消息；passive=false 走主动通道（不带 msg_id，不占被动回复预算） */
+async function uploadAndSendLocalFile(
+  accessToken: string,
+  ctx: MessageContext,
+  path: string,
+  fileName: string,
+  passive: boolean,
+): Promise<void> {
+  const fileData = readFileSync(path).toString("base64")
+  const fileType = detectOutboundFileType(fileName)
+  const msgId = passive ? ctx.msgId : undefined
+  const msgSeq = passive ? getNextMsgSeq(ctx.msgId) : undefined
+
+  const doUpload = async (): Promise<void> => {
+    if (ctx.type === "group" && ctx.groupId) {
+      const fileInfo = await uploadGroupFile(accessToken, ctx.groupId, { fileType, fileData, fileName })
+      await sendGroupMediaMessage(accessToken, ctx.groupId, fileInfo, msgId, msgSeq)
+    } else {
+      const fileInfo = await uploadC2CFile(accessToken, ctx.userId, { fileType, fileData, fileName })
+      await sendC2CMediaMessage(accessToken, ctx.userId, fileInfo, msgId, msgSeq)
+    }
+  }
+  await withSendRetry(fileName, doUpload)
+}
+
+/**
+ * 按 partSize 把 src 切成若干分片写入临时目录（outDir 缺省自建），分片名 = 原名 + `.001`/`.002`…
+ * 定宽编号保证 `cat 原名.00* > 原名` 的字典序即正确顺序。
+ */
+export function splitFileParts(src: string, partSize: number, outDir?: string): string[] {
+  const stat = statSync(src)
+  const total = Math.max(1, Math.ceil(stat.size / partSize))
+  const dir = outDir ?? mkdtempSync(join(tmpdir(), "openqq-parts-"))
+  mkdirSync(dir, { recursive: true })
+  const base = basename(src)
+  const digits = Math.max(3, String(total).length)
+  const parts: string[] = []
+  const fd = openSync(src, "r")
+  try {
+    const buf = Buffer.alloc(partSize)
+    for (let i = 0; i < total; i++) {
+      const read = readSync(fd, buf, 0, partSize, i * partSize)
+      const partPath = join(dir, `${base}.${String(i + 1).padStart(digits, "0")}`)
+      writeFileSync(partPath, read > 0 ? buf.subarray(0, read) : buf.subarray(0, 0))
+      parts.push(partPath)
+    }
+  } finally {
+    closeSync(fd)
+  }
+  return parts
+}
+
 /**
  * 把本机文件或公网 URL 发送给 QQ 用户/群（先上传富媒体，再发 msg_type=7 消息，作为被动回复关联原消息）。
  * http(s) URL 走官方 URL 上传：平台自动下载转存，跳过本地读取与 SEND_FILE_MAX_BYTES 体积检查（大小限制由平台侧处理）。
+ *
+ * 本地文件超过 SEND_FILE_INLINE_MAX_BYTES（默认 4MB）时按 SEND_FILE_SPLIT 自动分片：
+ * 首片作为被动回复，其余走主动通道（绕开单 msg_id 4 次被动预算），分片文件用完即删。
+ * 返回非空字符串 = 需要展示给用户的分片说明（合并命令等）。
  */
 export async function sendFileToQQ(
   accessToken: string,
   ctx: MessageContext,
   filePath: string,
   maxBytes: number = 0,
-): Promise<void> {
+): Promise<string | undefined> {
   if (isHttpUrl(filePath)) {
     const fileType = detectUrlFileType(filePath)
     const fileName = urlFileName(filePath)
@@ -219,8 +331,9 @@ export async function sendFileToQQ(
       const fileInfo = await uploadC2CFileByUrl(accessToken, ctx.userId, { fileType, url: filePath, fileName })
       await sendC2CMediaMessage(accessToken, ctx.userId, fileInfo, ctx.msgId, msgSeq)
     }
-    return
+    return undefined
   }
+
   const stat = statSync(filePath)
   if (!stat.isFile()) {
     throw new Error(`不是文件：${filePath}`)
@@ -228,18 +341,61 @@ export async function sendFileToQQ(
   if (maxBytes > 0 && stat.size > maxBytes) {
     throw new Error(`文件过大 ${(stat.size / 1048576).toFixed(1)}MB（上限 ${Math.round(maxBytes / 1048576)}MB）`)
   }
-  const name = basename(filePath)
-  const fileType = detectOutboundFileType(name)
-  const fileData = readFileSync(filePath).toString("base64")
-  const msgSeq = getNextMsgSeq(ctx.msgId)
 
-  if (ctx.type === "group" && ctx.groupId) {
-    const fileInfo = await uploadGroupFile(accessToken, ctx.groupId, { fileType, fileData, fileName: name })
-    await sendGroupMediaMessage(accessToken, ctx.groupId, fileInfo, ctx.msgId, msgSeq)
-  } else {
-    const fileInfo = await uploadC2CFile(accessToken, ctx.userId, { fileType, fileData, fileName: name })
-    await sendC2CMediaMessage(accessToken, ctx.userId, fileInfo, ctx.msgId, msgSeq)
+  const name = basename(filePath)
+  const { inlineMaxBytes, split, partDelayMs, maxParts } = fileSendSettings()
+  const passive = Boolean(ctx.msgId)
+
+  // 阈值内：一次内联上传（原行为）
+  if (stat.size <= inlineMaxBytes) {
+    await uploadAndSendLocalFile(accessToken, ctx, filePath, name, passive)
+    return undefined
   }
+
+  const sizeMb = (stat.size / 1048576).toFixed(1)
+  const inlineMb = (inlineMaxBytes / 1048576).toFixed(1)
+  const total = Math.ceil(stat.size / inlineMaxBytes)
+
+  if (!split) {
+    throw new Error(
+      `${sizeMb}MB 超过 QQ 内联上传上限 ${inlineMb}MB（超过会 413/500），已禁用分片（SEND_FILE_SPLIT=off）。` +
+        `请压缩后重试、改用公网 URL，或开启分片。`,
+    )
+  }
+  if (total > maxParts) {
+    throw new Error(
+      `${sizeMb}MB 需分 ${total} 片，超过 SEND_FILE_MAX_PARTS=${maxParts}。请压缩后重试或调高该值。`,
+    )
+  }
+
+  // 超限：分片发送
+  let parts: string[] = []
+  let outDir = ""
+  try {
+    outDir = mkdtempSync(join(tmpdir(), "openqq-parts-"))
+    parts = splitFileParts(filePath, inlineMaxBytes, outDir)
+    for (let i = 0; i < parts.length; i++) {
+      // 首片作为被动回复关联原消息；后续片走主动通道，避免撞单 msg_id 4 次被动预算
+      await uploadAndSendLocalFile(accessToken, ctx, parts[i], basename(parts[i]), i === 0 && passive)
+      if (i < parts.length - 1 && partDelayMs > 0) await sleep(partDelayMs)
+    }
+  } finally {
+    if (outDir) {
+      try {
+        rmSync(outDir, { recursive: true, force: true })
+      } catch {
+        // 分片残留不影响主流程
+      }
+    }
+  }
+
+  const digits = Math.max(3, String(parts.length).length)
+  const glob = `${name}.${"0".repeat(digits - 1)}*`
+  return (
+    `📦 ${name}（${sizeMb}MB）超过单次上传上限 ${inlineMb}MB，已自动分 ${parts.length} 片：` +
+    `${name}.${String(1).padStart(digits, "0")} ~ ${name}.${String(parts.length).padStart(digits, "0")}。` +
+    `合并：cat ${glob} > ${name}`
+  )
 }
 
 // ---------------------------------------------------------------------------

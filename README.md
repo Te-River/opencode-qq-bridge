@@ -202,6 +202,10 @@ systemctl --user enable --now openqq.service
 | `ATTACHMENT_DIR` | `~/.openqq/attachments` | 二进制附件落盘目录 |
 | `SEND_FILE_MAX_BYTES` | `104857600` | 机器人发回文件的体积上限（100MB） |
 | `SEND_FILE_HINT` | `on` | 是否在提示里注入发文件说明 |
+| `SEND_FILE_INLINE_MAX_BYTES` | `4194304` | 单次内联 base64 上传上限（4MB），超过则分片 |
+| `SEND_FILE_SPLIT` | `on` | 超过内联上限时自动分片发送 |
+| `SEND_FILE_PART_DELAY_MS` | `800` | 分片之间的发送间隔（防频控） |
+| `SEND_FILE_MAX_PARTS` | `40` | 分片数上限，超过则报错（避免刷屏） |
 
 ### 后台任务 / Markdown
 
@@ -253,6 +257,34 @@ systemctl --user enable --now openqq.service
 
 此时走 QQ 官方 **URL 上传**：平台自动下载转存，无需本地落盘；`file_type` 按 URL 扩展名推断
 （图片/视频/语音/文件，未知扩展按文件处理），体积限制由平台侧处理（跳过本地 `SEND_FILE_MAX_BYTES` 检查）。
+
+### 大文件：为什么必须分片
+
+QQ 富媒体 `file_data`（base64 内联）通道实测（2026-10，`api.sgroup.qq.com`）：
+
+| 文件大小 | 请求体 | 实测结果 |
+|---|---|---|
+| ≤ 4.5MB | ≤ 6.0MB | `200 OK`（稳定） |
+| 5 ~ 14MB | 6.7 ~ 18.7MB | 频繁 `500 call inner proxy error`（`850012`） |
+| ≥ 20MB | ≥ 26.7MB | `413 Request Entity Too Large`（`stgw` 网关硬拒绝，无重试机会） |
+
+所以默认 `SEND_FILE_INLINE_MAX_BYTES=4MB`，超过就**自动分片**：首片作为被动回复关联原消息，
+其余片走**主动通道**（不占单 `msg_id` 4 次被动回复预算），片间隔 `SEND_FILE_PART_DELAY_MS`，
+分片临时文件用完即删。发送后会在最终文本里附说明与合并命令，例如：
+
+```
+📦 report.zip（48.3MB）超过单次上传上限 4.0MB，已自动分 13 片：report.zip.001 ~ report.zip.013。
+合并：cat report.zip.00* > report.zip
+```
+
+分片数超过 `SEND_FILE_MAX_PARTS`（默认 40）时改为报错；`SEND_FILE_SPLIT=off` 则**不发任何请求**
+直接报错（干净日志，不白传几十 MB）。
+
+**更大文件的三个建议**（也会写进给模型的系统提示）：
+
+1. 先压缩（如 `zip -9`）；
+2. 提供公网 `https://` URL 走 QQ 的 URL 上传（腾讯侧下载，**不受 4MB 限制**）；
+3. 关闭分片，由人来决定怎么传。
 
 ---
 

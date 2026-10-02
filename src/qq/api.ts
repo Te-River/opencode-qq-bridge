@@ -224,12 +224,22 @@ export async function apiRequest<T = unknown>(
   console.log("[qqbot-api] <<< Headers:", JSON.stringify(responseHeaders, null, 2))
 
   let data: T
-  let rawBody: string
+  let rawBody = ""
   try {
     rawBody = await res.text()
     console.log("[qqbot-api] <<< Body:", rawBody)
     data = JSON.parse(rawBody) as T
   } catch (err) {
+    // 非 JSON 错误体（如网关 413 的 HTML）：保留状态码与原文，别退化成 "parse failed" 把根因藏掉
+    if (!res.ok) {
+      console.error(`[qqbot-api] <<< Non-JSON error body, status=${res.status}`)
+      throw new QQApiError(
+        res.status,
+        path,
+        rawBody,
+        `API Error [${path}]: HTTP ${res.status} ${res.statusText}: ${rawBody.slice(0, 300)}`,
+      )
+    }
     console.error("[qqbot-api] <<< Parse error:", err)
     throw new Error(`Failed to parse response [${path}]: ${err instanceof Error ? err.message : String(err)}`)
   }

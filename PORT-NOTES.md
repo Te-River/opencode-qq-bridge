@@ -132,6 +132,41 @@ Bun >= 1.0；`ws`（QQ Gateway）。已移除 `@opencode-ai/sdk` 依赖。
 > 示例：用户"把当前目录打包成 zip 发我" → AI 执行 `zip -r /tmp/xx.zip .` →
 > 回复中写 `[[sendfile:/tmp/xx.zip]]` → 桥把 zip 发给该用户。
 
+### 大文件自动分片（413 根因与修复）
+
+**现象**：发 40+MB 的 zip，`file_data` base64 达 48MB → 网关
+`<<< Status: 413 Request Entity Too Large  server: stgw`，请求体原样被拒。
+
+**实测边界**（`POST /v2/users/{openid}/files`，`srv_send_msg=false` 只上传不发消息，用户无感知）：
+
+| 文件 | 请求体 | 结果 |
+|---|---|---|
+| 1 / 2 / 4 / 4.5MB | 1.3 ~ 6.0MB | `200 OK`，稳定 |
+| 6MB | 8.0MB | 一次 200、一次 500（抖动） |
+| 8 / 10 / 12 / 14MB | 10.7 ~ 18.7MB | `500 call inner proxy error (850012)` |
+| 20 / 30 / 36 / 40MB | 26.7 ~ 48MB | `413`（<1s，网关硬拒绝） |
+
+⇒ **可靠内联上限 ≈ 4MB**；19~27MB 请求体之间是 413 的硬边界。
+
+**实现**（`src/qq/sender.ts`）：
+
+- 阈值内（`SEND_FILE_INLINE_MAX_BYTES`，默认 4MB）→ 原单次内联上传，行为不变。
+- 超阈值且 `SEND_FILE_SPLIT=on`（默认）→ `splitFileParts()` 切片：
+  - 定宽编号 `原名.001/.002/…`（`cat 原名.00* > 原名` 字典序即正确顺序）；
+  - **首片被动**（带 `msg_id`），**其余片主动**（不带 `msg_id`，绕开单 `msg_id` 4 次被动预算）；
+  - 片间隔 `SEND_FILE_PART_DELAY_MS`（默认 800ms）防频控；
+  - 临时目录用完 `rmSync` 清理；返回可读说明（片数 + 合并命令）拼进最终文本。
+- 分片数 > `SEND_FILE_MAX_PARTS`（默认 40）→ 报错，避免刷屏。
+- `SEND_FILE_SPLIT=off` → 超阈值**一个请求都不发**，直接给出含大小与建议的错误。
+- 重试：仅网络错误 / 429 / 5xx，最多 3 次（退避 1s、2s）；**413 与其它 4xx 不重试**。
+- `apiRequest` 对**非 JSON 错误体**（413 返回 HTML）改为抛 `QQApiError`，
+  保留 `HTTP 413 Request Entity Too Large` 与前 300 字符原文，不再退化成
+  `Failed to parse response` 把根因藏掉。
+
+**已知替代通道**：`[[sendfile:https://…]]` 走平台 URL 上传，由腾讯侧下载，**不受内联 body 上限**。
+本机为 NAT 内网（无公网入站），可用 Tailscale Funnel 临时把本地文件暴露成公网 https URL
+（需 tailnet 开启 Funnel：`https://login.tailscale.com/f/funnel?node=…`）。
+
 ## 后台任务（长命令自动转后台）
 
 OpenCode 会把耗时较长的 shell 命令**移到后台**（工具返回 `Command moved to the background (shell ID: sh_…)`），
