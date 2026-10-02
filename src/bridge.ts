@@ -1,10 +1,12 @@
-// @input:  ./config, ./qq/* (types, api, sender), ./opencode/* (client, events, sessions), ./commands
+// @input:  ./config, ./copy, ./qq/* (types, api, sender), ./opencode/* (client, events, sessions), ./commands
 // @output: createBridge
-// @pos:    根层 - 核心桥接: QQ 消息 -> OpenCode -> QQ 回复
-import type { Config } from "./config.js"
+// @pos:    根层 - 核心桥接: QQ 消息 -> OpenCode -> QQ 回复（含流式输出接线）
+import type { Config, ProgressConfig } from "./config.js"
+import { DEFAULT_PROGRESS } from "./config.js"
 import type { MessageContext } from "./qq/types.js"
 import { getAccessToken } from "./qq/api.js"
-import { replyToQQ, sendProactiveToQQ, sendFileToQQ } from "./qq/sender.js"
+import { replyToQQ, sendProactiveToQQ, sendFileToQQ, StreamSession } from "./qq/sender.js"
+import { renderCopy, type Scene, type CopyVars } from "./copy.js"
 import { mkdirSync, writeFileSync } from "fs"
 import { join } from "path"
 import { homedir } from "os"
@@ -27,14 +29,7 @@ const RESPONSE_IDLE_TIMEOUT_MS = Number(process.env.RESPONSE_IDLE_TIMEOUT_MS ?? 
 const RESPONSE_MAX_MS = Number(process.env.RESPONSE_MAX_MS ?? 60 * 60 * 1000)
 const STILL_WORKING_POLL_MS = 30 * 1000
 const CHECK_INTERVAL_MS = 15 * 1000
-// 中间进度消息（走主动消息，不受被动回复次数限制）
-const PROGRESS_ENABLED = (process.env.PROGRESS ?? "on").toLowerCase() !== "off"
-const PROGRESS_MAX = Number(process.env.PROGRESS_MAX ?? 0) // 0 = 不限
-const PROGRESS_MIN_INTERVAL_MS = Number(process.env.PROGRESS_MIN_INTERVAL_MS ?? 1200)
-const PROGRESS_HEARTBEAT_MS = Number(process.env.PROGRESS_HEARTBEAT_MS ?? 60 * 1000)
-const PROGRESS_TEXT_MAX = Number(process.env.PROGRESS_TEXT_MAX ?? 600)
-const PROGRESS_TOOL_RESULT = (process.env.PROGRESS_TOOL_RESULT ?? "on").toLowerCase() !== "off"
-const PROGRESS_TOOL_RESULT_MAX = Number(process.env.PROGRESS_TOOL_RESULT_MAX ?? 300)
+// 中间进度开关（PROGRESS_*）已迁入 config.progress，env 名/默认值不变
 // 附件（图片/文件）单个体积上限，超过则跳过并提示
 const ATTACHMENT_MAX_BYTES = Number(process.env.ATTACHMENT_MAX_BYTES ?? 25 * 1024 * 1024)
 // 附件落盘目录（供 AI 用工具读取二进制文件，如 .sqlite）
@@ -72,6 +67,8 @@ export function createBridge(
 ): Bridge {
   const userQueues = new Map<string, UserQueue>()
   const pendingSelections = new Map<string, PendingSelection>()
+  // 流式会话登记：permission.asked 时按 OpenCode sessionId 找到在途流
+  const activeStreams = new Map<string, StreamSession>()
   const commandContext: CommandContext = {
     config,
     client,
@@ -91,7 +88,9 @@ export function createBridge(
     },
   }
 
-  setupPermissionAutoAck(router, client, config.opencode.workspaceDir)
+  setupPermissionAutoAck(router, client, config.opencode.workspaceDir, (sessionId) =>
+    activeStreams.get(sessionId),
+  )
 
   const handleMessage = async (ctx: MessageContext): Promise<void> => {
     try {
@@ -181,20 +180,37 @@ export function createBridge(
     const promptOptions = buildPromptOptions(ctx.userId, sessions)
     const startedAt = Date.now()
 
+    // 流式输出（实验性）：仅私聊 + STREAMING=on；群聊不构造（构造函数双保险抛错）
+    const stream = config.streaming.enabled && ctx.type === "c2c"
+      ? new StreamSession({
+          token: () => getAccessToken(config.qq.appId, config.qq.clientSecret),
+          ctx,
+          render: (scene, vars) => renderCopy(scene, vars, config.texts),
+          intervalMs: config.streaming.intervalMs,
+          chunkSize: config.streaming.chunkSize,
+          maxScenes: config.streaming.maxScenes,
+        })
+      : null
+
     // 进度走「主动消息」，不占用被动回复次数；串行发送并限制最小间隔，避免刷屏/限频
+    // 流式开启时改走 StreamSession 场景切换（场景切换计入 progressUsed，正文 flush 不计入）
     let progressUsed = 0
     let lastProgressAt = 0
     let progressChain: Promise<void> = Promise.resolve()
-    const sendProgress = (text: string): Promise<void> => {
-      if (!PROGRESS_ENABLED) return progressChain
-      if (PROGRESS_MAX > 0 && progressUsed >= PROGRESS_MAX) return progressChain
+    const sendProgress = (scene: Scene, vars: CopyVars): Promise<void> => {
+      if (!config.progress.enabled) return progressChain
+      if (config.progress.max > 0 && progressUsed >= config.progress.max) return progressChain
       progressUsed++
       progressChain = progressChain.then(async () => {
-        const wait = PROGRESS_MIN_INTERVAL_MS - (Date.now() - lastProgressAt)
+        const wait = config.progress.minIntervalMs - (Date.now() - lastProgressAt)
         if (wait > 0) await new Promise((r) => setTimeout(r, wait))
         lastProgressAt = Date.now()
         try {
-          await sendProactiveReply(ctx, text)
+          if (stream && stream.state === "streaming") {
+            await stream.switchScene(scene, vars)
+          } else {
+            await sendProactiveReply(ctx, renderCopy(scene, vars, config.texts))
+          }
         } catch (error) {
           console.error("[bridge] 进度消息发送失败（忽略）:", toErrorMessage(error))
         }
@@ -202,17 +218,42 @@ export function createBridge(
       return progressChain
     }
 
-    const { text: replyText, backgroundShells } = await waitForSessionReply(router, client, session.sessionId, () => {
-      void startSessionPrompt(client, session.sessionId, ctx.content, promptOptions, ctx.attachments)
-    }, ctx.userId, config.opencode.workspaceDir, sendProgress, startedAt)
+    try {
+      if (stream) await stream.start().catch(() => {}) // start 失败→state=failed→后续自动走非流式
+      if (stream && stream.state === "streaming") activeStreams.set(session.sessionId, stream)
 
-    // 等进度消息都发完，再发最终结果，保证顺序
-    await progressChain.catch(() => {})
-    await deliverResult(ctx, replyText, "reply")
+      const { text: replyText, backgroundShells } = await waitForSessionReply(
+        router,
+        client,
+        session.sessionId,
+        () => {
+          void startSessionPrompt(client, session.sessionId, ctx.content, promptOptions, ctx.attachments)
+        },
+        ctx.userId,
+        config.opencode.workspaceDir,
+        sendProgress,
+        startedAt,
+        (delta: string) => {
+          if (stream) void stream.pushBody(delta)
+        },
+        config.progress,
+      )
 
-    // 本轮结束后继续监视：后台任务完成时 OpenCode 会自动让 AI 继续输出，转发给用户
-    if (MONITOR_ENABLED) {
-      startMonitor(ctx, session.sessionId, backgroundShells)
+      // 等进度消息都发完，再发最终结果，保证顺序
+      await progressChain.catch(() => {})
+      const streamedOk = stream ? await stream.finish(replyText) : false
+      await deliverResult(ctx, replyText, "reply", streamedOk)
+
+      // 本轮结束后继续监视：后台任务完成时 OpenCode 会自动让 AI 继续输出，转发给用户
+      if (MONITOR_ENABLED) {
+        startMonitor(ctx, session.sessionId, backgroundShells)
+      }
+    } catch (error) {
+      // 等待/投递失败：弃流（不发终片），错误回复走 processQueueLoop 既有路径
+      if (stream) await stream.abort()
+      throw error
+    } finally {
+      activeStreams.delete(session.sessionId)
     }
   }
 
@@ -227,10 +268,12 @@ export function createBridge(
   }
 
   // 把 AI 的文本结果（含 [[sendfile:...]] 标记）投递给用户
+  // textAlreadyDelivered=true（流式已完整投递正文）时跳过正文只发文件
   async function deliverResult(
     ctx: MessageContext,
     replyText: string,
     mode: "reply" | "proactive",
+    textAlreadyDelivered: boolean = false,
   ): Promise<void> {
     const { text: cleanText, files } = extractSendFiles(replyText)
     const sendFileErrors: string[] = []
@@ -249,7 +292,7 @@ export function createBridge(
     }
 
     const finalParts: string[] = []
-    if (cleanText.trim()) finalParts.push(cleanText)
+    if (!textAlreadyDelivered && cleanText.trim()) finalParts.push(cleanText)
     if (sendFileErrors.length > 0) finalParts.push(`⚠ 文件发送失败：\n${sendFileErrors.join("\n")}`)
     const finalText = finalParts.join("\n\n")
     if (!finalText.trim()) return
@@ -298,7 +341,7 @@ export function createBridge(
     const flushIntermediate = (): void => {
       const text = extractSendFiles(pendingText.trim()).text
       if (!text) return
-      const snippet = text.length > PROGRESS_TEXT_MAX ? `${text.slice(0, PROGRESS_TEXT_MAX)}…` : text
+      const snippet = text.length > config.progress.textMax ? `${text.slice(0, config.progress.textMax)}…` : text
       send(`💬 ${snippet}`)
     }
 
@@ -318,7 +361,7 @@ export function createBridge(
         return
       }
       const idle = now - lastActivityAt
-      if (now - lastHeartbeatAt >= PROGRESS_HEARTBEAT_MS && idle >= CHECK_INTERVAL_MS) {
+      if (now - lastHeartbeatAt >= config.progress.heartbeatMs && idle >= CHECK_INTERVAL_MS) {
         lastHeartbeatAt = now
         const elapsed = now - bgStartAt
         const mins = Math.floor(elapsed / 60000)
@@ -354,7 +397,7 @@ export function createBridge(
           const name = String(data.name ?? data.tool ?? "工具")
           const callId = typeof data.id === "string" ? data.id : ""
           if (callId) toolNames.set(callId, name)
-          send(`🔧 调用工具：${name}`)
+          if (config.progress.toolCall) send(`🔧 调用工具：${name}`)
           return
         }
         case "session.tool.success": {
@@ -365,9 +408,9 @@ export function createBridge(
           if (bg) {
             shells.add(bg[1])
             bgStartAt = Date.now()
-          } else if (PROGRESS_TOOL_RESULT && result) {
+          } else if (config.progress.toolResult && result) {
             const snippet =
-              result.length > PROGRESS_TOOL_RESULT_MAX ? `${result.slice(0, PROGRESS_TOOL_RESULT_MAX)}…` : result
+              result.length > config.progress.toolResultMax ? `${result.slice(0, config.progress.toolResultMax)}…` : result
             send(`📄 ${name} 返回：${snippet}`)
           }
           return
@@ -450,7 +493,12 @@ function buildPromptOptions(userId: string, sessions: SessionManager): PromptOpt
   }
 }
 
-function setupPermissionAutoAck(router: EventRouter, client: OpencodeClient, workspaceDir?: string): void {  router.registerPermissionCallback((permission) => {
+function setupPermissionAutoAck(
+  router: EventRouter,
+  client: OpencodeClient,
+  workspaceDir?: string,
+  getActiveStream?: (sessionId: string) => StreamSession | undefined,
+): void {  router.registerPermissionCallback((permission) => {
     const { id, sessionID, type, pattern, title } = permission
     let response: "allow" | "reject" = "reject"
 
@@ -464,6 +512,9 @@ function setupPermissionAutoAck(router: EventRouter, client: OpencodeClient, wor
     } else {
       response = "reject"
     }
+
+    // 流式会话进行中：向占位流推送权限提示（fire-and-forget）；非流式路径保持静默 auto-ack
+    void getActiveStream?.(sessionID)?.switchScene("PERMISSION", { title: title ?? type })
 
     console.log(`[bridge] auto-ack permission id=${id} type=${type} pattern=${JSON.stringify(pattern)} -> ${response}`)
     const reply = response === "allow" ? "once" : "reject"
@@ -482,8 +533,10 @@ async function waitForSessionReply(
   startPrompt: () => void,
   userId: string,
   workspaceDir?: string,
-  notify?: (text: string) => Promise<void>,
+  notify?: (scene: Scene, vars: CopyVars) => Promise<void>,
   startedAt: number = Date.now(),
+  onDelta?: (delta: string) => void,
+  progress: ProgressConfig = DEFAULT_PROGRESS,
 ): Promise<{ text: string; backgroundShells: string[] }> {
   let settled = false
   let currentText = ""
@@ -496,9 +549,9 @@ async function waitForSessionReply(
   // 只接受「本次提问之后」生成的助手消息，避免把上一轮的回复当成结果
   const sinceCreated = startedAt
   const deadline = startedAt + RESPONSE_MAX_MS
-  const sendProgress = (text: string): void => {
+  const sendProgress = (scene: Scene, vars: CopyVars): void => {
     if (!notify) return
-    void notify(text).catch((error) => console.error("[bridge] 进度回调失败（忽略）:", toErrorMessage(error)))
+    void notify(scene, vars).catch((error) => console.error("[bridge] 进度回调失败（忽略）:", toErrorMessage(error)))
   }
 
   return new Promise<{ text: string; backgroundShells: string[] }>((resolve, reject) => {
@@ -538,8 +591,8 @@ async function waitForSessionReply(
       // 去掉可能的发文件标记，避免中间消息里泄漏 [[sendfile:...]]
       const text = extractSendFiles(raw).text
       if (!text) return
-      const snippet = text.length > PROGRESS_TEXT_MAX ? `${text.slice(0, PROGRESS_TEXT_MAX)}…` : text
-      sendProgress(`💬 ${snippet}`)
+      const snippet = text.length > progress.textMax ? `${text.slice(0, progress.textMax)}…` : text
+      sendProgress("TEXT", { snippet })
     }
 
     // 工具返回摘要（拼接文本内容并压缩空白）
@@ -576,12 +629,12 @@ async function waitForSessionReply(
       const idleMs = now - lastActivityAt
 
       // 中间进度心跳：长时间无输出时告知仍在处理
-      if (now - lastHeartbeatAt >= PROGRESS_HEARTBEAT_MS && idleMs >= CHECK_INTERVAL_MS) {
+      if (now - lastHeartbeatAt >= progress.heartbeatMs && idleMs >= CHECK_INTERVAL_MS) {
         lastHeartbeatAt = now
         const elapsed = Math.max(0, now - startedAt)
         const mins = Math.floor(elapsed / 60000)
         const secs = Math.floor((elapsed % 60000) / 1000)
-        sendProgress(`⏳ 仍在处理中（已用 ${mins} 分 ${secs} 秒）…`)
+        sendProgress("HEARTBEAT", { min: mins, sec: secs })
       }
 
       // 兜底拉取已完成的结果（SSE 丢失时）
@@ -620,6 +673,7 @@ async function waitForSessionReply(
           const delta = typeof data.delta === "string" ? data.delta : ""
           currentText += delta
           lastActivityAt = Date.now()
+          onDelta?.(delta)
           return
         }
         case "session.text.ended": {
@@ -633,13 +687,13 @@ async function waitForSessionReply(
           const name = String(data.name ?? data.tool ?? "工具")
           const callId = typeof data.id === "string" ? data.id : ""
           if (callId) toolNames.set(callId, name)
-          sendProgress(`🔧 调用工具：${name}`)
+          if (progress.toolCall) sendProgress("TOOL_CALL", { tool: name })
           return
         }
         case "session.tool.failed": {
           lastActivityAt = Date.now()
           const message = typeof data.error === "string" ? data.error : "工具执行失败"
-          sendProgress(`❌ 工具失败：${message.slice(0, 120)}`)
+          sendProgress("TOOL_FAILED", { error: message.slice(0, 120) })
           return
         }
         case "session.tool.success": {
@@ -650,10 +704,10 @@ async function waitForSessionReply(
           // 命令被移到后台执行 → 记录 shell ID，用于后续对用户保持心跳/跟踪
           const bg = result.match(/shell ID:\s*(sh_[A-Za-z0-9]+)/i)
           if (bg) backgroundShells.add(bg[1])
-          if (PROGRESS_TOOL_RESULT && result) {
+          if (progress.toolResult && result) {
             const snippet =
-              result.length > PROGRESS_TOOL_RESULT_MAX ? `${result.slice(0, PROGRESS_TOOL_RESULT_MAX)}…` : result
-            sendProgress(`📄 ${name} 返回：${snippet}`)
+              result.length > progress.toolResultMax ? `${result.slice(0, progress.toolResultMax)}…` : result
+            sendProgress("TOOL_RESULT", { tool: name, result: snippet })
           }
           return
         }
